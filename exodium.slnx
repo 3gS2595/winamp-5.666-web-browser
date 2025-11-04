@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="exodium/exodium.vcxproj" Id="456602a5-f475-40a0-98aa-331475f0786e" />
+</Solution>

@@ -227,6 +227,30 @@ static void UpdateReloadButton(BrowserWindow* win)
     SetWindowTextW(win->btnReload, win->isLoading ? L"⏹" : L"↺");
 }
 
+// Give the frame its own taskbar button / Alt+Tab slot. Winamp creates the
+// embed frame as a top-level window owned by the main window, so it is
+// suppressed from the switcher unless it carries WS_EX_APPWINDOW.
+static void EnableTaskbarButton(HWND frame)
+{
+    if (!frame) return;
+    LONG_PTR ex = GetWindowLongPtr(frame, GWL_EXSTYLE);
+    ex |= WS_EX_APPWINDOW;
+    ex &= ~WS_EX_TOOLWINDOW;
+    SetWindowLongPtr(frame, GWL_EXSTYLE, ex);
+}
+
+// Reflect the active tab's title in the frame caption so each window is a
+// distinct, recognizable Alt+Tab entry.
+static void UpdateFrameTitle(BrowserWindow* win)
+{
+    if (!win->embedFrame) return;
+    std::wstring t;
+    if (win->active >= 0 && win->active < (int)win->tabs.size())
+        t = win->tabs[win->active].title;
+    if (t.empty() || t == L"(new tab)") t = L"Exodium";
+    SetWindowTextW(win->embedFrame, t.c_str());
+}
+
 static void ReopenLastClosedTab(BrowserWindow* win)
 {
     if (g_closedTabs.empty()) return;
@@ -689,6 +713,7 @@ static void UpdateTabTitle(BrowserWindow* win, int idx, const wchar_t* t) {
     if (idx < 0 || idx >= (int)win->tabs.size()) return;
     win->tabs[idx].title = t ? t : L"(tab)";
     if (win->tabs[idx].btn) SetWindowTextW(win->tabs[idx].btn, win->tabs[idx].title.c_str());
+    if (idx == win->active) UpdateFrameTitle(win);
 }
 static void SwitchToTab(BrowserWindow* win, int idx) {
     if (win->isFullscreen) return; // the active tab's controller is parented elsewhere right now
@@ -699,6 +724,7 @@ static void SwitchToTab(BrowserWindow* win, int idx) {
     win->active = idx;
     LayoutActiveWebView(win);
     UpdateUrlBox(win);
+    UpdateFrameTitle(win);
     HideSuggestions(win);
 
     for (int i = 0; i < (int)win->tabs.size(); ++i)
@@ -925,11 +951,64 @@ static void WireTabEvents(BrowserWindow* win, int tabId) {
 
     web->add_NewWindowRequested(Microsoft::WRL::Callback<ICoreWebView2NewWindowRequestedEventHandler>(
         [win](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* a)->HRESULT {
-            LPWSTR uri = nullptr;
-            a->get_Uri(&uri);
-            if (WinAlive(win)) NewTab(win, uri ? uri : L"about:blank");
-            if (uri) CoTaskMemFree(uri);
-            a->put_Handled(TRUE);
+            // Popup-based OAuth (Google Identity Services, etc.) hands the caller's
+            // script a reference via window.open() and talks to it over
+            // window.opener/postMessage. That only works if we give WebView2 a real
+            // CoreWebView2 via put_NewWindow — a plain new tab leaves window.open()
+            // returning null and breaks those sign-in flows.
+            if (!WinAlive(win) || !g_env) {
+                a->put_Handled(TRUE);
+                return S_OK;
+            }
+
+            Microsoft::WRL::ComPtr<ICoreWebView2NewWindowRequestedEventArgs> args(a);
+            Microsoft::WRL::ComPtr<ICoreWebView2Deferral> deferral;
+            args->GetDeferral(&deferral);
+
+            int idx = (int)win->tabs.size();
+            win->tabs.push_back(Tab{});
+            int tabId = win->nextTabId++;
+            win->tabs[idx].id = tabId;
+            win->tabs[idx].title = L"(new tab)";
+            LayoutToolbarAndTabs(win);
+            SwitchToTab(win, idx);
+
+            g_env->CreateCoreWebView2Controller(win->client,
+                Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                    [win, tabId, args, deferral](HRESULT hr2, ICoreWebView2Controller* ctl)->HRESULT {
+                        if (SUCCEEDED(hr2) && ctl && WinAlive(win)) {
+                            int i = TabIndexById(win, tabId);
+                            if (i >= 0) {
+                                win->tabs[i].ctl = ctl;
+                                ctl->get_CoreWebView2(&win->tabs[i].web);
+
+                                RECT rc; GetClientRect(win->client, &rc);
+                                RECT b = { kMargin, kTabBarH + kToolbarH, rc.right - kMargin, rc.bottom - kMargin };
+                                ctl->put_Bounds(b);
+                                ctl->put_IsVisible(FALSE);
+
+                                WireTabEvents(win, tabId);
+
+                                // Must not be navigated before this call — WebView2
+                                // auto-navigates it to the requested uri once assigned.
+                                args->put_NewWindow(win->tabs[i].web.Get());
+
+                                if (i == win->active) {
+                                    LayoutActiveWebView(win);
+                                    win->tabs[i].ctl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                                }
+                            }
+                            else {
+                                ctl->Close();
+                            }
+                        }
+                        else if (ctl) {
+                            ctl->Close();
+                        }
+                        args->put_Handled(TRUE);
+                        deferral->Complete();
+                        return S_OK;
+                    }).Get());
             return S_OK;
         }).Get(), nullptr);
 
@@ -1241,6 +1320,7 @@ static BrowserWindow* CreateBrowserWindow(bool show)
     }
     SetWindowTextW(win->embedFrame, L"Exodium");
     win->prevFrameProc = (WNDPROC)SetWindowLongPtr(win->embedFrame, GWLP_WNDPROC, (LONG_PTR)FrameProc);
+    EnableTaskbarButton(win->embedFrame);
 
     // Cascade additional windows so they don't stack exactly on the first.
     if (g_windows.size() > 1) {

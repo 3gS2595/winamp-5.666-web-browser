@@ -110,6 +110,7 @@ struct BrowserWindow {
 
     bool isFullscreen = false;
     RECT savedFrameRect{};
+    LONG_PTR savedStyle = 0;
 };
 
 static std::vector<std::unique_ptr<BrowserWindow>> g_windows;
@@ -779,6 +780,7 @@ static void EnterVideoFullscreen(BrowserWindow* win) {
     if (win->isFullscreen || !win->embedFrame) return;
 
     GetWindowRect(win->embedFrame, &win->savedFrameRect);
+    win->savedStyle = GetWindowLongPtr(win->embedFrame, GWL_STYLE);
 
     HMONITOR mon = MonitorFromWindow(win->embedFrame, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = { sizeof(MONITORINFO) };
@@ -787,11 +789,16 @@ static void EnterVideoFullscreen(BrowserWindow* win) {
     win->isFullscreen = true;
     SetToolbarControlsVisible(win, false);
 
-    SetWindowPos(win->embedFrame, HWND_TOPMOST,
+    LONG_PTR fsStyle = win->savedStyle & ~(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
+    SetWindowLongPtr(win->embedFrame, GWL_STYLE, fsStyle);
+
+    // HWND_TOP (not HWND_TOPMOST) brings it to front once without pinning it
+    // above every other window, so alt-tabbing away still works normally.
+    SetWindowPos(win->embedFrame, HWND_TOP,
         mi.rcMonitor.left, mi.rcMonitor.top,
         mi.rcMonitor.right - mi.rcMonitor.left,
         mi.rcMonitor.bottom - mi.rcMonitor.top,
-        SWP_SHOWWINDOW);
+        SWP_FRAMECHANGED | SWP_SHOWWINDOW);
 }
 
 static void ExitVideoFullscreen(BrowserWindow* win) {
@@ -799,11 +806,13 @@ static void ExitVideoFullscreen(BrowserWindow* win) {
 
     win->isFullscreen = false;
 
-    SetWindowPos(win->embedFrame, HWND_NOTOPMOST,
+    SetWindowLongPtr(win->embedFrame, GWL_STYLE, win->savedStyle);
+
+    SetWindowPos(win->embedFrame, nullptr,
         win->savedFrameRect.left, win->savedFrameRect.top,
         win->savedFrameRect.right - win->savedFrameRect.left,
         win->savedFrameRect.bottom - win->savedFrameRect.top,
-        SWP_SHOWWINDOW);
+        SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW);
 
     SetToolbarControlsVisible(win, true);
     LayoutToolbarAndTabs(win);

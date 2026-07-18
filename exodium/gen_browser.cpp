@@ -1,7 +1,8 @@
-﻿// STAGE 9c: Dark mode + tabs + SPA URL sync + suggestions + PERSISTENT history
-// + Ctrl+L hotkey + rock-solid Enter-to-navigate from URL bar
-// If your project uses PCH, keep first:
-// #include "pch.h"
+// STAGE 14: Multi-window support.
+// - All per-window state moved from globals into a BrowserWindow struct.
+// - Multiple embedded browser windows, each with its own tabs/toolbar.
+// - Ctrl+N opens a new window. History and closed-tab stack stay shared.
+// - Tab async events now key off a stable per-tab id (not a shifting index).
 
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601
@@ -17,8 +18,10 @@
 #include <wrl.h>
 #include <vector>
 #include <string>
+#include <memory>
 #include <algorithm>
 #include <cstdio>
+#include <functional>
 #include "WebView2.h"
 
 #pragma comment(lib, "comctl32.lib")
@@ -27,12 +30,21 @@
 #include "gen.h"
 #include "wa_ipc.h"
 #include "embedwnd.h"
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
 
+using namespace Gdiplus;
 using Microsoft::WRL::ComPtr;
+
+// FIX: LNK2001 error (unresolved external symbol "wchar_t * ini_file")
+// The embedwnd utility requires this global variable from the Winamp SDK context.
+wchar_t* ini_file = nullptr;
 
 // ---- IDs / layout ----
 enum : int {
     IDC_BACK = 1001, IDC_FWD = 1002, IDC_URL = 1003, IDC_GO = 1004,
+    IDC_RELOAD = 1005,
+    IDC_CLOSE_TAB = 1006,
     IDC_TABBAR = 1100, IDC_NEW_TAB = 1101,
     IDC_SUGGEST = 1200,
 };
@@ -41,26 +53,24 @@ static const int  kBtnW = 64, kBtnGap = 6, kMargin = 6;
 static const UINT WM_APP_INIT_WEBVIEW = WM_APP + 42;
 static const UINT WM_APP_SWITCH_TAB = WM_APP + 43;
 
-// Hotkey id for Ctrl+L
-static const int HK_CTRLL = 0xC001;
-
 static HINSTANCE g_hInst = nullptr;
-static HWND g_embedFrame = nullptr;
-static WNDPROC g_prevFrameProc = nullptr;
-static HWND g_client = nullptr;
 
-static HWND g_tabBar = nullptr;
-static HWND g_newTabBtn = nullptr;
-static HWND g_btnBack = nullptr, g_btnFwd = nullptr, g_btnGo = nullptr, g_editUrl = nullptr;
+// ---- Winamp parent subclass (single hook, dispatches to all windows) ----
+static WNDPROC g_oldWaProc = nullptr;
 
-// suggestions
-static HWND g_suggest = nullptr;
-static bool g_suggestVisible = false;
+// ---- shared WebView2 environment ----
+static ComPtr<ICoreWebView2Environment> g_env;
+static bool g_envCreating = false;
+static std::vector<std::function<void()>> g_envPendingCallbacks;
 
-// edit state
-static bool g_editDirty = false;   // user is typing
-static bool g_settingUrl = false;  // programmatic SetWindowText guard
+// ---- shared UI resources ----
+static HBRUSH g_brBlack = nullptr, g_brPanel = nullptr, g_brEdit = nullptr;
+static COLORREF g_colBg = RGB(0, 0, 0), g_colPanel = RGB(16, 16, 16), g_colBtnActive = RGB(32, 32, 32), g_colText = RGB(255, 255, 255);
+static HFONT g_font = nullptr;
+static ULONG_PTR g_gdiplusToken = 0;
+static bool g_globalsReady = false;
 
+// ---- per-window model ----
 struct Tab {
     ComPtr<ICoreWebView2Controller> ctl;
     ComPtr<ICoreWebView2> web;
@@ -68,25 +78,79 @@ struct Tab {
     std::wstring title;
     std::wstring pendingUri;
     std::wstring lastUri;
+    HICON favicon = nullptr;
+    int id = 0;                 // stable id for async event routing
 };
-static std::vector<Tab> g_tabs;
-static int g_active = -1;
 
-// persisted MRU history
+struct BrowserWindow {
+    HWND embedFrame = nullptr;
+    WNDPROC prevFrameProc = nullptr;
+    HWND client = nullptr;
+
+    HWND tabBar = nullptr;
+    HWND newTabBtn = nullptr;
+    HWND btnBack = nullptr, btnFwd = nullptr, btnGo = nullptr, editUrl = nullptr;
+    HWND btnReload = nullptr;
+    HWND btnCloseTab = nullptr;
+    bool isLoading = false;
+
+    HWND suggest = nullptr;
+    bool suggestVisible = false;
+
+    bool editDirty = false;
+    bool settingUrl = false;
+
+    std::vector<Tab> tabs;
+    int active = -1;
+    int nextTabId = 1;
+
+    embedWindowState ews = { 0 };
+    UINT_PTR menuId = (UINT_PTR)-1;
+    GUID guid = {};
+};
+
+static std::vector<std::unique_ptr<BrowserWindow>> g_windows;
+
+// ---- shared history / closed tabs ----
 static std::vector<std::wstring> g_history;
+struct ClosedTab { std::wstring url; };
+static std::vector<ClosedTab> g_closedTabs;
 
-static embedWindowState g_ews = { 0 };
-static const GUID kEmbedGuid = { 0x3f8b13b9,0x2bd9,0x4b3c,{0x94,0x5a,0x2a,0x8d,0xc7,0x60,0x3e,0x11} };
-
-// ---- Dark resources ----
-static HBRUSH g_brBlack = nullptr, g_brPanel = nullptr, g_brEdit = nullptr;
-static COLORREF g_colBg = RGB(0, 0, 0), g_colPanel = RGB(16, 16, 16), g_colBtnActive = RGB(32, 32, 32), g_colText = RGB(255, 255, 255);
-static HFONT g_font = nullptr;
+// ---- window/tab lookup ----
+static BrowserWindow* WinFromClient(HWND client) {
+    for (auto& w : g_windows) if (w->client == client) return w.get();
+    return nullptr;
+}
+static BrowserWindow* WinFromFrame(HWND frame) {
+    for (auto& w : g_windows) if (w->embedFrame == frame) return w.get();
+    return nullptr;
+}
+static BrowserWindow* WinFromChild(HWND child) { return WinFromClient(GetParent(child)); }
+static bool WinAlive(BrowserWindow* win) {
+    for (auto& w : g_windows) if (w.get() == win) return true;
+    return false;
+}
+static int TabIndexById(BrowserWindow* win, int id) {
+    for (int i = 0; i < (int)win->tabs.size(); ++i) if (win->tabs[i].id == id) return i;
+    return -1;
+}
 
 // ---------- persistence ----------
 static void ModuleDir(wchar_t* out, size_t cch) { out[0] = 0; if (!GetModuleFileNameW((HINSTANCE)g_hInst, out, (DWORD)cch))return; PathRemoveFileSpecW(out); }
-static std::wstring DataDirPath() { wchar_t d[MAX_PATH]; ModuleDir(d, MAX_PATH); std::wstring p = d; p += L"\\exodium_data"; CreateDirectoryW(p.c_str(), nullptr); return p; }
+
+static std::wstring DataDirPath() {
+    wchar_t d[MAX_PATH]; ModuleDir(d, MAX_PATH);
+    std::wstring p = d; p += L"\\exodium_data";
+    CreateDirectoryW(p.c_str(), nullptr);
+    return p;
+}
+static std::wstring WebViewProfilePath() {
+    std::wstring p = DataDirPath() + L"\\webview_profile";
+    CreateDirectoryW(p.c_str(), nullptr);
+    return p;
+}
 static std::wstring HistoryFilePath() { auto p = DataDirPath(); p += L"\\history.txt"; return p; }
+
 static void TrimCRLF(std::wstring& s) { while (!s.empty() && (s.back() == L'\r' || s.back() == L'\n')) s.pop_back(); }
 static bool IsLikelyHttpUrl(const std::wstring& u) {
     if (u.empty()) return false;
@@ -121,86 +185,229 @@ static void SaveHistory() {
 }
 
 // ---------- helpers ----------
-static void FocusAddressBar() { SetFocus(g_editUrl); SendMessageW(g_editUrl, EM_SETSEL, 0, -1); }
-static std::wstring GetActiveUrl() {
-    if (g_active < 0 || g_active >= (int)g_tabs.size() || !g_tabs[g_active].web) return L"";
-    LPWSTR uri = nullptr; std::wstring out; if (SUCCEEDED(g_tabs[g_active].web->get_Source(&uri))) { if (uri) { out = uri; CoTaskMemFree(uri); } } return out;
+static void LayoutToolbarAndTabs(BrowserWindow* win);
+static void SwitchToTab(BrowserWindow* win, int idx);
+static void NavigateFromUrlBox(BrowserWindow* win);
+static void NextTab(BrowserWindow* win);
+static void PrevTab(BrowserWindow* win);
+static void CloseActiveTab(BrowserWindow* win);
+static void SubclassCtrlCommon(HWND h);
+static void ApplySuggestSelectionToEdit(BrowserWindow* win);
+static LRESULT CALLBACK SuggestSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR);
+static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+static LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+static LRESULT CALLBACK WaSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+static void NewTab(BrowserWindow* win, const wchar_t* url = L"https://google.com/");
+static void CreateWebViewForTab(BrowserWindow* win, int tabId);
+static BrowserWindow* CreateBrowserWindow(bool show);
+
+static void FocusAddressBar(BrowserWindow* win) { SetFocus(win->editUrl); SendMessageW(win->editUrl, EM_SETSEL, 0, -1); }
+static std::wstring GetActiveUrl(BrowserWindow* win) {
+    if (win->active < 0 || win->active >= (int)win->tabs.size() || !win->tabs[win->active].web) return L"";
+    LPWSTR uri = nullptr; std::wstring out; if (SUCCEEDED(win->tabs[win->active].web->get_Source(&uri))) { if (uri) { out = uri; CoTaskMemFree(uri); } } return out;
 }
-static void UpdateUrlBox() {
-    if (GetFocus() == g_editUrl && g_editDirty) return;
-    if (g_active < 0 || g_active >= (int)g_tabs.size() || !g_tabs[g_active].web) return;
+static void UpdateUrlBox(BrowserWindow* win) {
+    if (GetFocus() == win->editUrl && win->editDirty) return;
+    if (win->active < 0 || win->active >= (int)win->tabs.size() || !win->tabs[win->active].web) return;
     LPWSTR uri = nullptr;
-    if (SUCCEEDED(g_tabs[g_active].web->get_Source(&uri))) {
-        g_settingUrl = true; SetWindowTextW(g_editUrl, uri ? uri : L""); g_settingUrl = false;
+    if (SUCCEEDED(win->tabs[win->active].web->get_Source(&uri))) {
+        win->settingUrl = true; SetWindowTextW(win->editUrl, uri ? uri : L""); win->settingUrl = false;
         if (uri) CoTaskMemFree(uri);
     }
 }
+static void UpdateReloadButton(BrowserWindow* win)
+{
+    if (!win->btnReload) return;
+    SetWindowTextW(win->btnReload, win->isLoading ? L"⏹" : L"↺");
+}
 
-// Forward decls
-static void LayoutToolbarAndTabs();
-static void SwitchToTab(int idx);
-static void NavigateFromUrlBox();
-static void NextTab();
-static void PrevTab();
-static void CloseActiveTab();
-static void SubclassCtrlCommon(HWND h);
-static void NewTab(const wchar_t* url = L"https://google.com/");
+static void ReopenLastClosedTab(BrowserWindow* win)
+{
+    if (g_closedTabs.empty()) return;
+    ClosedTab ct = g_closedTabs.back();
+    g_closedTabs.pop_back();
+    if (!ct.url.empty())
+        NewTab(win, ct.url.c_str());
+}
 
+static bool HandleGlobalShortcut(BrowserWindow* win, WPARAM w, bool ctrl, bool shift, bool alt) {
+    // Handles shortcuts locally when the plugin or webview is focused.
 
-static bool HandleGlobalShortcut(WPARAM w, bool ctrl, bool shift, bool alt) {
-    // Ctrl+L: focus URL bar
-    if (ctrl && !shift && !alt && w == 'L') { FocusAddressBar(); g_editDirty = true; return true; }
+    if (ctrl && !shift && !alt && w == 'N') { CreateBrowserWindow(true); return true; }
 
-    // Ctrl+T / Ctrl+W: new/close tab
-    if (ctrl && !alt && !shift && w == 'T') { NewTab(); return true; }
-    if (ctrl && !alt && !shift && w == 'W') { CloseActiveTab(); return true; }
+    if (ctrl && shift && !alt && w == 'T') { ReopenLastClosedTab(win); return true; }
 
-    // Ctrl+Tab / Ctrl+Shift+Tab: next/prev tab
-    if (ctrl && !alt && w == VK_TAB) { if (shift) PrevTab(); else NextTab(); return true; }
+    if (!win) return false;
 
-    // Alt+Left/Right: browser nav
-    if (!ctrl && !shift && alt && w == VK_LEFT && g_active >= 0 && g_tabs[g_active].web) { g_tabs[g_active].web->GoBack();    return true; }
-    if (!ctrl && !shift && alt && w == VK_RIGHT && g_active >= 0 && g_tabs[g_active].web) { g_tabs[g_active].web->GoForward(); return true; }
+    if (ctrl && !shift && !alt && w == 'L') { FocusAddressBar(win); win->editDirty = true; return true; }
+    if (ctrl && !alt && !shift && w == 'T') { NewTab(win); return true; }
+    if (ctrl && !alt && !shift && w == 'W') { CloseActiveTab(win); return true; }
+
+    if (ctrl && !alt && w == VK_TAB) {
+        if (shift) PrevTab(win); else NextTab(win);
+        return true;
+    }
+
+    if (!ctrl && !shift && alt && w == VK_LEFT && win->active >= 0 && win->tabs[win->active].web) {
+        win->tabs[win->active].web->GoBack();    return true;
+    }
+    if (!ctrl && !shift && alt && w == VK_RIGHT && win->active >= 0 && win->tabs[win->active].web) {
+        win->tabs[win->active].web->GoForward(); return true;
+    }
 
     return false;
 }
+
+static void ApplySuggestSelectionToEdit(BrowserWindow* win) {
+    if (!win->suggestVisible || !win->suggest || !win->editUrl) return;
+    LRESULT sel = SendMessageW(win->suggest, LB_GETCURSEL, 0, 0);
+    if (sel == LB_ERR) return;
+    wchar_t buf[2048] = L"";
+    SendMessageW(win->suggest, LB_GETTEXT, (WPARAM)sel, (LPARAM)buf);
+    win->settingUrl = true;
+    SetWindowTextW(win->editUrl, buf);
+    win->settingUrl = false;
+    SendMessageW(win->editUrl, EM_SETSEL, 0, -1);
+}
+
+static bool LooksLikeDomain(const std::wstring& s) {
+    if (s.empty()) return false;
+    if (s.find(L' ') != std::wstring::npos) return false;
+    auto dot = s.find(L'.'); if (dot == std::wstring::npos) return false;
+    auto lastDot = s.rfind(L'.');
+    if (lastDot == std::wstring::npos || lastDot + 1 >= s.size()) return false;
+    size_t tldLen = s.size() - (lastDot + 1);
+    if (tldLen < 2 || tldLen > 24) return false;
+    for (size_t i = lastDot + 1; i < s.size(); ++i) {
+        if (!iswalpha(s[i])) return false;
+    }
+    return true;
+}
+
+static std::wstring BuildGoogleQuery(const std::wstring& q) {
+    wchar_t enc[4096];
+    DWORD cch = ARRAYSIZE(enc);
+    if (FAILED(UrlEscapeW(q.c_str(), enc, &cch, URL_ESCAPE_PERCENT | URL_ESCAPE_AS_UTF8))) {
+        return L"https://www.google.com/search?q=" + q;
+    }
+    std::wstring url = L"https://www.google.com/search?q=";
+    url += enc;
+    return url;
+}
+
+static LRESULT CALLBACK WaSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    for (auto& w : g_windows)
+        HandleEmbeddedWindowWinampWindowMessages(w->embedFrame, (UINT)w->menuId, &w->ews, TRUE, hwnd, msg, wParam, lParam);
+    LRESULT r = CallWindowProc(g_oldWaProc, hwnd, msg, wParam, lParam);
+    for (auto& w : g_windows)
+        HandleEmbeddedWindowWinampWindowMessages(w->embedFrame, (UINT)w->menuId, &w->ews, FALSE, hwnd, msg, wParam, lParam);
+    return r;
+}
+
+static void HookWinampParent()
+{
+    if (!g_oldWaProc)
+        g_oldWaProc = (WNDPROC)SetWindowLongPtr(plugin.hwndParent, GWLP_WNDPROC, (LONG_PTR)WaSubclassProc);
+}
+
+static void EnsureGlobals()
+{
+    if (g_globalsReady) return;
+
+    INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES };
+    InitCommonControlsEx(&icc);
+
+    g_brBlack = CreateSolidBrush(g_colBg);
+    g_brPanel = CreateSolidBrush(g_colPanel);
+    g_brEdit = CreateSolidBrush(g_colBg);
+    g_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = ClientProc;
+    wc.hInstance = g_hInst;
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.lpszClassName = L"ExodiumClient";
+    RegisterClassW(&wc);
+
+    LoadHistory();
+
+    g_globalsReady = true;
+}
+
 // ---------- owner draw ----------
-static void DrawOwnerButton(const DRAWITEMSTRUCT* dis, bool isTab, bool isActive) {
-    HDC dc = dis->hDC; RECT r = dis->rcItem;
+static void DrawOwnerButton(const DRAWITEMSTRUCT* dis, bool isTab, bool isActive, HICON hIcon) {
+    HDC dc = dis->hDC;
+    RECT r = dis->rcItem;
+
     COLORREF bg = isTab ? (isActive ? g_colBtnActive : g_colPanel) : g_colPanel;
-    HBRUSH br = CreateSolidBrush(bg); FillRect(dc, &r, br); DeleteObject(br);
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(60, 60, 60)); HPEN old = (HPEN)SelectObject(dc, pen);
-    MoveToEx(dc, r.left, r.top, nullptr); LineTo(dc, r.right - 1, r.top); LineTo(dc, r.right - 1, r.bottom - 1);
-    LineTo(dc, r.left, r.bottom - 1); LineTo(dc, r.left, r.top); SelectObject(dc, old); DeleteObject(pen);
-    wchar_t text[256]; GetWindowTextW(dis->hwndItem, text, ARRAYSIZE(text));
-    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, g_colText);
+    HBRUSH br = CreateSolidBrush(bg);
+    FillRect(dc, &r, br);
+    DeleteObject(br);
+
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(60, 60, 60));
+    HPEN old = (HPEN)SelectObject(dc, pen);
+    MoveToEx(dc, r.left, r.top, nullptr);
+    LineTo(dc, r.right - 1, r.top);
+    LineTo(dc, r.right - 1, r.bottom - 1);
+    LineTo(dc, r.left, r.bottom - 1);
+    LineTo(dc, r.left, r.top);
+    SelectObject(dc, old);
+    DeleteObject(pen);
+
+    RECT textRect = r;
+
+    if (isTab && hIcon) {
+        const int iconSize = 16;
+        const int padding = 4;
+        int btnHeight = r.bottom - r.top;
+        int iconY = r.top + (btnHeight - iconSize) / 2;
+
+        DrawIconEx(dc, r.left + padding, iconY, hIcon, iconSize, iconSize, 0, nullptr, DI_NORMAL);
+
+        textRect.left += iconSize + padding * 2;
+    }
+
+    wchar_t text[256];
+    GetWindowTextW(dis->hwndItem, text, ARRAYSIZE(text));
+
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, g_colText);
+
     HFONT oldf = (HFONT)SelectObject(dc, g_font ? g_font : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
-    DrawTextW(dc, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    DrawTextW(dc, text, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     SelectObject(dc, oldf);
-    if (dis->itemState & ODS_FOCUS) { RECT rf = r; InflateRect(&rf, -3, -3); DrawFocusRect(dc, &rf); }
+
+    if (dis->itemState & ODS_FOCUS) {
+        RECT rf = textRect;
+        InflateRect(&rf, -3, -3);
+        DrawFocusRect(dc, &rf);
+    }
 }
 
 // ---------- suggestions ----------
-static void HideSuggestions() { if (g_suggest) ShowWindow(g_suggest, SW_HIDE); g_suggestVisible = false; }
-static void EnsureSuggestListbox() {
-    if (!g_suggest) {
-        g_suggest = CreateWindowExW(WS_EX_TOOLWINDOW, L"LISTBOX", L"", WS_CHILD | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER,
-            0, 0, 0, 0, g_client, (HMENU)IDC_SUGGEST, g_hInst, nullptr);
-        SendMessageW(g_suggest, WM_SETFONT, (WPARAM)g_font, TRUE);
-        SubclassCtrlCommon(g_suggest); // <-- important
+static void HideSuggestions(BrowserWindow* win) { if (win->suggest) ShowWindow(win->suggest, SW_HIDE); win->suggestVisible = false; }
+static void EnsureSuggestListbox(BrowserWindow* win) {
+    if (!win->suggest) {
+        win->suggest = CreateWindowExW(
+            WS_EX_TOOLWINDOW, L"LISTBOX", L"",
+            WS_CHILD | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER,
+            0, 0, 0, 0, win->client, (HMENU)IDC_SUGGEST, g_hInst, nullptr);
+        SendMessageW(win->suggest, WM_SETFONT, (WPARAM)g_font, TRUE);
+        SetWindowSubclass(win->suggest, SuggestSubproc, 2, 0);
     }
 }
-static void PositionSuggestBelowEdit(int items) {
-    RECT er; GetWindowRect(g_editUrl, &er);
+static void PositionSuggestBelowEdit(BrowserWindow* win, int items) {
+    RECT er; GetWindowRect(win->editUrl, &er);
     POINT tl{ er.left,er.bottom }, br{ er.right,er.bottom };
-    ScreenToClient(g_client, &tl); ScreenToClient(g_client, &br);
-    int itemH = (int)SendMessageW(g_suggest, LB_GETITEMHEIGHT, 0, 0); if (itemH <= 0) itemH = 18;
+    ScreenToClient(win->client, &tl); ScreenToClient(win->client, &br);
+    int itemH = (int)SendMessageW(win->suggest, LB_GETITEMHEIGHT, 0, 0); if (itemH <= 0) itemH = 18;
     int h = min(items, 8) * itemH + 2, w = (br.x - tl.x);
-    SetWindowPos(g_suggest, HWND_TOP, tl.x, tl.y, w, h, SWP_SHOWWINDOW);
+    SetWindowPos(win->suggest, HWND_TOP, tl.x, tl.y, w, h, SWP_SHOWWINDOW);
 }
-static void PopulateSuggestions(const std::wstring& q) {
-    EnsureSuggestListbox(); SendMessageW(g_suggest, LB_RESETCONTENT, 0, 0);
-    if (q.size() < 2) { HideSuggestions(); return; }
+static void PopulateSuggestions(BrowserWindow* win, const std::wstring& q) {
+    EnsureSuggestListbox(win); SendMessageW(win->suggest, LB_RESETCONTENT, 0, 0);
+    if (q.size() < 2) { HideSuggestions(win); return; }
     auto wlower = [](std::wstring s) { for (auto& c : s) c = (wchar_t)towlower(c); return s; };
     std::wstring ql = wlower(q); std::vector<std::wstring> matches;
     auto add_if = [&](const std::wstring& s) {
@@ -210,296 +417,603 @@ static void PopulateSuggestions(const std::wstring& q) {
         };
     for (const auto& u : g_history) { std::wstring ul = wlower(u); if (ul.find(ql) == 0) add_if(u); }
     for (const auto& u : g_history) { std::wstring ul = wlower(u); if (!ul.empty() && ul.find(ql) != 0 && ul.find(ql) != std::wstring::npos) add_if(u); }
-    if (matches.empty()) { HideSuggestions(); return; }
-    for (const auto& s : matches) SendMessageW(g_suggest, LB_ADDSTRING, 0, (LPARAM)s.c_str());
-    SendMessageW(g_suggest, LB_SETCURSEL, 0, 0); PositionSuggestBelowEdit((int)matches.size()); g_suggestVisible = true;
+    if (matches.empty()) { HideSuggestions(win); return; }
+    for (const auto& s : matches) SendMessageW(win->suggest, LB_ADDSTRING, 0, (LPARAM)s.c_str());
+    SendMessageW(win->suggest, LB_SETCURSEL, 0, 0); PositionSuggestBelowEdit(win, (int)matches.size()); win->suggestVisible = true;
 }
-static void CommitSuggestion(bool navigate) {
-    if (!g_suggestVisible) return;
-    LRESULT sel = SendMessageW(g_suggest, LB_GETCURSEL, 0, 0); if (sel == LB_ERR) return;
-    wchar_t buf[2048] = L""; SendMessageW(g_suggest, LB_GETTEXT, (WPARAM)sel, (LPARAM)buf);
-    g_settingUrl = true; SetWindowTextW(g_editUrl, buf); g_settingUrl = false;
-    HideSuggestions(); SetFocus(g_editUrl); SendMessageW(g_editUrl, EM_SETSEL, 0, -1);
-    if (navigate) { g_editDirty = false; NavigateFromUrlBox(); }
+static void CommitSuggestion(BrowserWindow* win, bool navigate) {
+    if (!win->suggestVisible) return;
+    LRESULT sel = SendMessageW(win->suggest, LB_GETCURSEL, 0, 0); if (sel == LB_ERR) return;
+    wchar_t buf[2048] = L""; SendMessageW(win->suggest, LB_GETTEXT, (WPARAM)sel, (LPARAM)buf);
+    win->settingUrl = true; SetWindowTextW(win->editUrl, buf); win->settingUrl = false;
+    HideSuggestions(win); SetFocus(win->editUrl); SendMessageW(win->editUrl, EM_SETSEL, 0, -1);
+    if (navigate) { win->editDirty = false; NavigateFromUrlBox(win); }
+}
+static LRESULT CALLBACK SuggestSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR)
+{
+    BrowserWindow* win = WinFromChild(h);
+    switch (m)
+    {
+    case WM_GETDLGCODE:
+        return DLGC_WANTALLKEYS | DLGC_WANTCHARS;
+
+    case WM_CHAR:
+    {
+        if (GetKeyState(VK_CONTROL) & 0x8000)
+            return 0;
+
+        wchar_t ch = static_cast<wchar_t>(w);
+
+        if (ch == L'\r') {
+            if (win) CommitSuggestion(win, true);
+            return 0;
+        }
+        if (ch == L'\x1b') {
+            if (win) { HideSuggestions(win); if (win->editUrl) SetFocus(win->editUrl); }
+            return 0;
+        }
+        break;
+    }
+
+    case WM_KEYDOWN:
+    {
+        int count = (int)SendMessageW(h, LB_GETCOUNT, 0, 0);
+        int sel = (int)SendMessageW(h, LB_GETCURSEL, 0, 0);
+        if (count <= 0)
+            break;
+
+        if (w == VK_RETURN) {
+            if (win) CommitSuggestion(win, true);
+            return 0;
+        }
+        if (w == VK_ESCAPE) {
+            if (win) { HideSuggestions(win); if (win->editUrl) SetFocus(win->editUrl); }
+            return 0;
+        }
+        if (w == VK_UP) {
+            if (sel <= 0) {
+                if (win && win->editUrl) {
+                    SetFocus(win->editUrl);
+                    SendMessageW(win->editUrl, EM_SETSEL, 0, -1);
+                }
+                return 0;
+            }
+            SendMessageW(h, LB_SETCURSEL, sel - 1, 0);
+            if (win) ApplySuggestSelectionToEdit(win);
+            return 0;
+        }
+        if (w == VK_DOWN) {
+            int next = (sel == LB_ERR) ? 0 : sel + 1;
+            if (next >= count)
+                next = count - 1;
+            SendMessageW(h, LB_SETCURSEL, next, 0);
+            if (win) ApplySuggestSelectionToEdit(win);
+            return 0;
+        }
+        break;
+    }
+    }
+
+    return DefSubclassProc(h, m, w, l);
 }
 
 // ---------- navigation ----------
-static void NavigateFromUrlBox() {
-    if (g_active < 0 || g_active >= (int)g_tabs.size()) return;
-    wchar_t url[2048] = L""; GetWindowTextW(g_editUrl, url, 2048); if (!url[0]) return;
-    if (!PathIsURLW(url)) { wchar_t buf[2048]; wsprintfW(buf, L"https://%s", url); lstrcpynW(url, buf, 2048); }
-    g_editDirty = false; HideSuggestions();
-    if (g_tabs[g_active].web) g_tabs[g_active].web->Navigate(url);
-    else { g_tabs[g_active].pendingUri = url; PostMessage(g_client, WM_APP_INIT_WEBVIEW, 0, 0); }
+static void NavigateFromUrlBox(BrowserWindow* win) {
+    if (win->active < 0 || win->active >= (int)win->tabs.size()) return;
+    wchar_t raw[2048] = L""; GetWindowTextW(win->editUrl, raw, ARRAYSIZE(raw));
+    std::wstring input = raw;
+    auto trim = [](std::wstring& s) {
+        auto notsp = [](wchar_t c) { return c != L' ' && c != L'\t' && c != L'\r' && c != L'\n'; };
+        while (!s.empty() && !notsp(s.front())) s.erase(s.begin());
+        while (!s.empty() && !notsp(s.back()))  s.pop_back();
+        };
+    trim(input);
+    if (input.empty()) return;
+    std::wstring urlToGo;
+    if (PathIsURLW(input.c_str())) urlToGo = input;
+    else if (LooksLikeDomain(input)) urlToGo = L"https://" + input;
+    else urlToGo = BuildGoogleQuery(input);
+
+    win->editDirty = false;
+    HideSuggestions(win);
+    if (win->tabs[win->active].web) win->tabs[win->active].web->Navigate(urlToGo.c_str());
+    else {
+        win->tabs[win->active].pendingUri = urlToGo;
+        PostMessage(win->client, WM_APP_INIT_WEBVIEW, 0, 0);
+    }
 }
 
 // ---------- edit subclass ----------
-static LRESULT CALLBACK EditSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
+static LRESULT CALLBACK EditSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR)
+{
+    BrowserWindow* win = WinFromChild(h);
     switch (m) {
+    case WM_NCCALCSIZE:
+        if (w) {
+            NCCALCSIZE_PARAMS* p = reinterpret_cast<NCCALCSIZE_PARAMS*>(l);
+            InflateRect(&p->rgrc[0], -1, -1);
+            return 0;
+        }
+        break;
+
+    case WM_NCPAINT: {
+        HDC hdc = GetWindowDC(h);
+        if (hdc) {
+            RECT wr; GetWindowRect(h, &wr); OffsetRect(&wr, -wr.left, -wr.top);
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(60, 60, 60));
+            HGDIOBJ oldPen = SelectObject(hdc, pen);
+            HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            Rectangle(hdc, 0, 0, wr.right - wr.left, wr.bottom - wr.top);
+            SelectObject(hdc, oldBrush);
+            SelectObject(hdc, oldPen);
+            DeleteObject(pen);
+            ReleaseDC(h, hdc);
+        }
+        return 0;
+    }
+
     case WM_GETDLGCODE:
-        // Tell Windows we want Enter/keys inside the edit (prevents default button from eating Enter)
         return DLGC_WANTALLKEYS | DLGC_WANTCHARS;
+
     case WM_KEYDOWN: {
         bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
-
-        if (HandleGlobalShortcut((WPARAM)w, ctrl, shift, alt)) return 0;
-
-        // (then your control-specific stuff)
-        if (ctrl && w == 'L') { FocusAddressBar(); g_editDirty = true; return 0; }
-        if (w == VK_DOWN && g_suggestVisible) { SetFocus(g_suggest); SendMessageW(g_suggest, LB_SETCURSEL, 0, 0); return 0; }
-        if (w == VK_ESCAPE && g_suggestVisible) { HideSuggestions(); return 0; }
-        if (w == VK_RETURN) { g_editDirty = false; NavigateFromUrlBox(); return 0; }
+        if (HandleGlobalShortcut(win, (WPARAM)w, ctrl, shift, alt)) return 0;
+        if (win && ctrl && w == 'L') { FocusAddressBar(win); win->editDirty = true; return 0; }
+        if (win && w == VK_DOWN && win->suggestVisible) {
+            SetFocus(win->suggest);
+            SendMessageW(win->suggest, LB_SETCURSEL, 0, 0);
+            ApplySuggestSelectionToEdit(win);
+            return 0;
+        }
+        if (win && w == VK_ESCAPE && win->suggestVisible) { HideSuggestions(win); return 0; }
+        if (win && w == VK_RETURN) { win->editDirty = false; NavigateFromUrlBox(win); return 0; }
         break;
     }
+
     case WM_CHAR:
-        if (w == L'\r') { g_editDirty = false; NavigateFromUrlBox(); return 0; }
+    {
+        if (GetKeyState(VK_CONTROL) & 0x8000)
+            return 0;
+
+        if (w == L'\r') {
+            if (win) { win->editDirty = false; NavigateFromUrlBox(win); }
+            return 0;
+        }
         break;
     }
+    }
+
     return DefSubclassProc(h, m, w, l);
 }
+
 static void SubclassCtrlCommon(HWND h) { if (h) SetWindowSubclass(h, EditSubproc, 1, 0); }
 
 // ---------- layout ----------
-static void LayoutActiveWebView() {
-    if (g_active < 0 || g_active >= (int)g_tabs.size()) return;
-    if (!g_tabs[g_active].ctl) return;
-    RECT rc; GetClientRect(g_client, &rc);
+static void LayoutActiveWebView(BrowserWindow* win) {
+    if (win->active < 0 || win->active >= (int)win->tabs.size()) return;
+    if (!win->tabs[win->active].ctl) return;
+    RECT rc; GetClientRect(win->client, &rc);
     int top = kTabBarH + kToolbarH; RECT b = { kMargin,top,rc.right - kMargin,rc.bottom - kMargin };
-    g_tabs[g_active].ctl->put_Bounds(b); g_tabs[g_active].ctl->put_IsVisible(TRUE);
+    win->tabs[win->active].ctl->put_Bounds(b); win->tabs[win->active].ctl->put_IsVisible(TRUE);
 }
-static void HideAllWebViews() { for (auto& t : g_tabs) if (t.ctl) t.ctl->put_IsVisible(FALSE); }
+static void HideAllWebViews(BrowserWindow* win) { for (auto& t : win->tabs) if (t.ctl) t.ctl->put_IsVisible(FALSE); }
 
-static void LayoutToolbarAndTabs() {
-    if (!g_client) return;
-    RECT rc; GetClientRect(g_client, &rc);
-    if (!g_tabBar) g_tabBar = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, g_client, (HMENU)IDC_TABBAR, g_hInst, nullptr);
-    MoveWindow(g_tabBar, 0, 0, rc.right, kTabBarH, TRUE);
+static void LayoutToolbarAndTabs(BrowserWindow* win) {
+    if (!win->client) return;
+    RECT rc; GetClientRect(win->client, &rc);
+    if (!win->tabBar) win->tabBar = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, win->client, (HMENU)IDC_TABBAR, g_hInst, nullptr);
+    MoveWindow(win->tabBar, 0, 0, rc.right, kTabBarH, TRUE);
 
     int x = kMargin; const int tabH = kTabBarH - 2, tabW = 140;
-    for (int i = 0; i < (int)g_tabs.size(); ++i) {
-        if (!g_tabs[i].btn) {
-            g_tabs[i].btn = CreateWindowExW(0, L"BUTTON", g_tabs[i].title.empty() ? L"(new tab)" : g_tabs[i].title.c_str(),
-                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, g_client, (HMENU)(INT_PTR)(WM_APP_SWITCH_TAB + i), g_hInst, nullptr);
-            SendMessageW(g_tabs[i].btn, WM_SETFONT, (WPARAM)(g_font ? g_font : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
-            SubclassCtrlCommon(g_tabs[i].btn);
+    for (int i = 0; i < (int)win->tabs.size(); ++i) {
+        if (!win->tabs[i].btn) {
+            win->tabs[i].btn = CreateWindowExW(0, L"BUTTON", win->tabs[i].title.empty() ? L"(new tab)" : win->tabs[i].title.c_str(),
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, win->client, (HMENU)(INT_PTR)(WM_APP_SWITCH_TAB + i), g_hInst, nullptr);
+            SendMessageW(win->tabs[i].btn, WM_SETFONT, (WPARAM)(g_font ? g_font : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+            SubclassCtrlCommon(win->tabs[i].btn);
         }
         else {
-            SetWindowLongPtrW(g_tabs[i].btn, GWLP_ID, (LONG_PTR)(WM_APP_SWITCH_TAB + i));
+            SetWindowLongPtrW(win->tabs[i].btn, GWLP_ID, (LONG_PTR)(WM_APP_SWITCH_TAB + i));
         }
-        MoveWindow(g_tabs[i].btn, x, 1, tabW, tabH, TRUE); x += tabW + 4;
+        MoveWindow(win->tabs[i].btn, x, 1, tabW, tabH, TRUE); x += tabW + 4;
     }
 
-    if (!g_newTabBtn) {
-        g_newTabBtn = CreateWindowExW(0, L"BUTTON", L"+", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, g_client, (HMENU)IDC_NEW_TAB, g_hInst, nullptr);
-        SendMessageW(g_newTabBtn, WM_SETFONT, (WPARAM)g_font, TRUE);
-        SubclassCtrlCommon(g_newTabBtn);
+    if (!win->newTabBtn) {
+        win->newTabBtn = CreateWindowExW(0, L"BUTTON", L"+", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, win->client, (HMENU)IDC_NEW_TAB, g_hInst, nullptr);
+        SendMessageW(win->newTabBtn, WM_SETFONT, (WPARAM)g_font, TRUE);
+        SubclassCtrlCommon(win->newTabBtn);
     }
-    MoveWindow(g_newTabBtn, rc.right - 26, 1, 24, tabH, TRUE);
+    MoveWindow(win->newTabBtn, rc.right - 26, 1, 24, tabH, TRUE);
 
     int y = kTabBarH + kMargin, h = kToolbarH - kMargin * 2, tX = kMargin;
 
-    if (!g_btnBack) g_btnBack = CreateWindowExW(0, L"BUTTON", L"Back", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, g_client, (HMENU)IDC_BACK, g_hInst, nullptr);
-    if (!g_btnFwd)  g_btnFwd = CreateWindowExW(0, L"BUTTON", L"Forward", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, g_client, (HMENU)IDC_FWD, g_hInst, nullptr);
-    if (!g_btnGo)   g_btnGo = CreateWindowExW(0, L"BUTTON", L"Go", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 0, 0, 0, 0, g_client, (HMENU)IDC_GO, g_hInst, nullptr);
-    if (!g_editUrl) g_editUrl = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"https://google.com/", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, g_client, (HMENU)IDC_URL, g_hInst, nullptr);
+    if (!win->btnBack)
+        win->btnBack = CreateWindowExW(0, L"BUTTON", L"←", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            0, 0, 0, 0, win->client, (HMENU)IDC_BACK, g_hInst, nullptr);
+    if (!win->btnFwd)
+        win->btnFwd = CreateWindowExW(0, L"BUTTON", L"→", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            0, 0, 0, 0, win->client, (HMENU)IDC_FWD, g_hInst, nullptr);
+    if (!win->btnReload)
+        win->btnReload = CreateWindowExW(0, L"BUTTON", L"↺", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            0, 0, 0, 0, win->client, (HMENU)IDC_RELOAD, g_hInst, nullptr);
+    if (!win->btnCloseTab)
+        win->btnCloseTab = CreateWindowExW(0, L"BUTTON", L"X", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            0, 0, 0, 0, win->client, (HMENU)IDC_CLOSE_TAB, g_hInst, nullptr);
+    if (!win->editUrl)
+        win->editUrl = CreateWindowExW(0, L"EDIT", L"https://google.com/", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            0, 0, 0, 0, win->client, (HMENU)IDC_URL, g_hInst, nullptr);
 
-    for (HWND hCtl : {g_btnBack, g_btnFwd, g_btnGo, g_editUrl}) SendMessageW(hCtl, WM_SETFONT, (WPARAM)g_font, TRUE);
-    SubclassCtrlCommon(g_btnBack); SubclassCtrlCommon(g_btnFwd); SubclassCtrlCommon(g_btnGo);
-    SetWindowSubclass(g_editUrl, EditSubproc, 1, 0);
+    for (HWND hCtl : { win->btnBack, win->btnFwd, win->btnReload, win->btnCloseTab, win->editUrl })
+        SendMessageW(hCtl, WM_SETFONT, (WPARAM)g_font, TRUE);
 
-    MoveWindow(g_btnBack, tX, y, kBtnW, h, TRUE); tX += kBtnW + kBtnGap;
-    MoveWindow(g_btnFwd, tX, y, kBtnW, h, TRUE); tX += kBtnW + kBtnGap;
+    SubclassCtrlCommon(win->btnBack);
+    SubclassCtrlCommon(win->btnFwd);
+    SubclassCtrlCommon(win->btnReload);
+    SubclassCtrlCommon(win->btnCloseTab);
+    SetWindowSubclass(win->editUrl, EditSubproc, 1, 0);
 
-    int urlW = (rc.right - tX) - (kBtnW + kMargin + kBtnGap); if (urlW < 120) urlW = 120;
-    MoveWindow(g_editUrl, tX, y, urlW, h, TRUE); tX += urlW + kBtnGap;
-    MoveWindow(g_btnGo, tX, y, kBtnW, h, TRUE);
+    MoveWindow(win->btnBack, tX, y, kBtnW, h, TRUE); tX += kBtnW + kBtnGap;
+    MoveWindow(win->btnFwd, tX, y, kBtnW, h, TRUE); tX += kBtnW + kBtnGap;
+    MoveWindow(win->btnReload, tX, y, kBtnW, h, TRUE); tX += kBtnW + kBtnGap;
+    MoveWindow(win->btnCloseTab, tX, y, kBtnW, h, TRUE); tX += kBtnW + kBtnGap;
 
-    EnsureSuggestListbox(); HideSuggestions();
+    int urlW = rc.right - tX - kMargin;
+    if (urlW < 120) urlW = 120;
+    MoveWindow(win->editUrl, tX, y, urlW, h, TRUE);
+    EnsureSuggestListbox(win); HideSuggestions(win);
 
-    if (!g_brPanel) g_brPanel = CreateSolidBrush(g_colPanel);
-    if (!g_brEdit)  g_brEdit = CreateSolidBrush(g_colBg);
-
-    LayoutActiveWebView();
+    LayoutActiveWebView(win);
 }
 
 // ---------- tab ops ----------
-static void UpdateTabTitle(int idx, const wchar_t* t) {
-    if (idx < 0 || idx >= (int)g_tabs.size()) return;
-    g_tabs[idx].title = t ? t : L"(tab)";
-    if (g_tabs[idx].btn) SetWindowTextW(g_tabs[idx].btn, g_tabs[idx].title.c_str());
+static void UpdateTabTitle(BrowserWindow* win, int idx, const wchar_t* t) {
+    if (idx < 0 || idx >= (int)win->tabs.size()) return;
+    win->tabs[idx].title = t ? t : L"(tab)";
+    if (win->tabs[idx].btn) SetWindowTextW(win->tabs[idx].btn, win->tabs[idx].title.c_str());
 }
-static void SwitchToTab(int idx) {
-    if (idx < 0 || idx >= (int)g_tabs.size()) return;
-    if (g_active == idx) return;
+static void SwitchToTab(BrowserWindow* win, int idx) {
+    if (idx < 0 || idx >= (int)win->tabs.size()) return;
+    if (win->active == idx) return;
 
-    HideAllWebViews();
-    g_active = idx;
-    LayoutActiveWebView();
-    UpdateUrlBox();
-    HideSuggestions();
+    HideAllWebViews(win);
+    win->active = idx;
+    LayoutActiveWebView(win);
+    UpdateUrlBox(win);
+    HideSuggestions(win);
 
-    // Visually mark active tab
-    for (int i = 0; i < (int)g_tabs.size(); ++i)
-        if (g_tabs[i].btn) SendMessageW(g_tabs[i].btn, BM_SETSTATE, (WPARAM)(i == g_active), 0);
+    for (int i = 0; i < (int)win->tabs.size(); ++i)
+        if (win->tabs[i].btn) SendMessageW(win->tabs[i].btn, BM_SETSTATE, (WPARAM)(i == win->active), 0);
 
-    // NEW: ensure the new WebView receives keyboard focus
-    if (g_tabs[g_active].ctl) {
-        g_tabs[g_active].ctl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+    if (win->tabs[win->active].ctl) {
+        win->tabs[win->active].ctl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
     }
 }
-static void NextTab() {
-    if (g_tabs.empty()) return;
-    int idx = (g_active + 1) % (int)g_tabs.size();
-    SwitchToTab(idx);
+static void NextTab(BrowserWindow* win) {
+    if (win->tabs.empty()) return;
+    int idx = (win->active + 1) % (int)win->tabs.size();
+    SwitchToTab(win, idx);
 }
-static void PrevTab() {
-    if (g_tabs.empty()) return;
-    int idx = (g_active - 1 + (int)g_tabs.size()) % (int)g_tabs.size();
-    SwitchToTab(idx);
+static void PrevTab(BrowserWindow* win) {
+    if (win->tabs.empty()) return;
+    int idx = (win->active - 1 + (int)win->tabs.size()) % (int)win->tabs.size();
+    SwitchToTab(win, idx);
 }
-static void NewTab(const wchar_t* url /*= L"https://google.com/"*/) {
+static void NewTab(BrowserWindow* win, const wchar_t* url /*= L"https://google.com/"*/) {
     if (!url) url = L"https://google.com/";
-    int idx = (int)g_tabs.size();
-    g_tabs.push_back(Tab{});
-    g_tabs[idx].title = L"(new tab)";
-    g_tabs[idx].pendingUri = url ? url : L"";
-    LayoutToolbarAndTabs();
-    SwitchToTab(idx);
-    PostMessage(g_client, WM_APP_INIT_WEBVIEW, 0, 0);
+    int idx = (int)win->tabs.size();
+    win->tabs.push_back(Tab{});
+    win->tabs[idx].id = win->nextTabId++;
+    win->tabs[idx].title = L"(new tab)";
+    win->tabs[idx].pendingUri = url ? url : L"";
+    LayoutToolbarAndTabs(win);
+    SwitchToTab(win, idx);
+    PostMessage(win->client, WM_APP_INIT_WEBVIEW, 0, 0);
 }
-static void CloseTab(int idx) {
-    if (idx < 0 || idx >= (int)g_tabs.size()) return;
-    if (g_tabs[idx].btn) { DestroyWindow(g_tabs[idx].btn); g_tabs[idx].btn = nullptr; }
-    if (g_tabs[idx].ctl) { g_tabs[idx].ctl->Close(); g_tabs[idx].ctl.Reset(); }
-    g_tabs[idx].web.Reset(); g_tabs.erase(g_tabs.begin() + idx);
-    if (g_tabs.empty()) { g_active = -1; NewTab(L"https://google.com/"); return; }
-    else if (g_active >= idx) g_active = max(0, g_active - 1);
-    LayoutToolbarAndTabs(); SwitchToTab(g_active);
+static void CloseTab(BrowserWindow* win, int idx) {
+    if (idx < 0 || idx >= (int)win->tabs.size()) return;
+
+    std::wstring closingUrl;
+    if (!win->tabs[idx].lastUri.empty()) {
+        closingUrl = win->tabs[idx].lastUri;
+    }
+    else if (win->tabs[idx].web) {
+        LPWSTR src = nullptr;
+        if (SUCCEEDED(win->tabs[idx].web->get_Source(&src)) && src) {
+            closingUrl = src;
+            CoTaskMemFree(src);
+        }
+    }
+    if (!closingUrl.empty()) {
+        g_closedTabs.push_back({ closingUrl });
+    }
+
+    if (win->tabs[idx].btn) { DestroyWindow(win->tabs[idx].btn); win->tabs[idx].btn = nullptr; }
+    if (win->tabs[idx].ctl) { win->tabs[idx].ctl->Close(); win->tabs[idx].ctl.Reset(); }
+    win->tabs[idx].web.Reset();
+    if (win->tabs[idx].favicon) { DestroyIcon(win->tabs[idx].favicon); win->tabs[idx].favicon = nullptr; }
+    win->tabs.erase(win->tabs.begin() + idx);
+
+    if (win->tabs.empty()) {
+        win->active = -1;
+        NewTab(win, L"https://google.com/");
+        return;
+    }
+    else if (win->active >= idx) {
+        win->active = max(0, win->active - 1);
+    }
+
+    LayoutToolbarAndTabs(win);
+    // Force a full refresh of the active tab's visuals since indices shifted.
+    int cur = win->active; win->active = -1; SwitchToTab(win, cur);
 }
-static void CloseActiveTab() { CloseTab(g_active); }
+static void CloseActiveTab(BrowserWindow* win) { CloseTab(win, win->active); }
 
 // ---------- webview wiring ----------
-static void WireTabEvents(int idx) {
-    if (idx < 0 || idx >= (int)g_tabs.size()) return;
-    auto* web = g_tabs[idx].web.Get(); auto* ctl = g_tabs[idx].ctl.Get(); if (!web || !ctl) return;
+static void WireTabEvents(BrowserWindow* win, int tabId) {
+    int idx = TabIndexById(win, tabId);
+    if (idx < 0) return;
+
+    ComPtr<ICoreWebView2> web = win->tabs[idx].web;
+    if (!web || !win->tabs[idx].ctl) return;
 
     web->add_DocumentTitleChanged(Microsoft::WRL::Callback<ICoreWebView2DocumentTitleChangedEventHandler>(
-        [idx](ICoreWebView2* s, IUnknown*)->HRESULT {
-            LPWSTR t = nullptr; if (s && SUCCEEDED(s->get_DocumentTitle(&t))) { UpdateTabTitle(idx, t); if (t) CoTaskMemFree(t); }
+        [win, tabId](ICoreWebView2* s, IUnknown*)->HRESULT {
+            if (!WinAlive(win)) return S_OK;
+            int i = TabIndexById(win, tabId); if (i < 0) return S_OK;
+            LPWSTR t = nullptr;
+            if (s && SUCCEEDED(s->get_DocumentTitle(&t))) {
+                UpdateTabTitle(win, i, t);
+                if (t) CoTaskMemFree(t);
+            }
             return S_OK;
         }).Get(), nullptr);
 
     web->add_NavigationStarting(Microsoft::WRL::Callback<ICoreWebView2NavigationStartingEventHandler>(
-        [idx](ICoreWebView2* s, ICoreWebView2NavigationStartingEventArgs* a)->HRESULT {
-            if (!s || !a) return S_OK; LPWSTR uri = nullptr;
-            if (SUCCEEDED(a->get_Uri(&uri))) { if (idx == g_active && !(GetFocus() == g_editUrl && g_editDirty)) { g_settingUrl = true; SetWindowTextW(g_editUrl, uri ? uri : L""); g_settingUrl = false; } if (uri) CoTaskMemFree(uri); }
+        [win, tabId](ICoreWebView2* s, ICoreWebView2NavigationStartingEventArgs* a)->HRESULT {
+            if (!s || !a || !WinAlive(win)) return S_OK;
+            int i = TabIndexById(win, tabId); if (i < 0) return S_OK;
+
+            if (i == win->active) {
+                win->isLoading = true;
+                UpdateReloadButton(win);
+            }
+
+            LPWSTR uri = nullptr;
+            if (SUCCEEDED(a->get_Uri(&uri))) {
+                if (i == win->active && !(GetFocus() == win->editUrl && win->editDirty)) {
+                    win->settingUrl = true;
+                    SetWindowTextW(win->editUrl, uri ? uri : L"");
+                    win->settingUrl = false;
+                }
+                if (uri) CoTaskMemFree(uri);
+            }
             return S_OK;
         }).Get(), nullptr);
 
     web->add_SourceChanged(Microsoft::WRL::Callback<ICoreWebView2SourceChangedEventHandler>(
-        [idx](ICoreWebView2* s, ICoreWebView2SourceChangedEventArgs*)->HRESULT {
-            if (!s || idx != g_active) return S_OK; if (GetFocus() == g_editUrl && g_editDirty) return S_OK;
-            LPWSTR src = nullptr; if (SUCCEEDED(s->get_Source(&src))) { g_settingUrl = true; SetWindowTextW(g_editUrl, src ? src : L""); g_settingUrl = false; if (src) CoTaskMemFree(src); }
+        [win, tabId](ICoreWebView2* s, ICoreWebView2SourceChangedEventArgs*)->HRESULT {
+            if (!s || !WinAlive(win)) return S_OK;
+            int i = TabIndexById(win, tabId); if (i < 0 || i != win->active) return S_OK;
+            if (GetFocus() == win->editUrl && win->editDirty) return S_OK;
+
+            LPWSTR src = nullptr;
+            if (SUCCEEDED(s->get_Source(&src))) {
+                win->settingUrl = true;
+                SetWindowTextW(win->editUrl, src ? src : L"");
+                win->settingUrl = false;
+                if (src) CoTaskMemFree(src);
+            }
             return S_OK;
         }).Get(), nullptr);
 
     web->add_NavigationCompleted(Microsoft::WRL::Callback<ICoreWebView2NavigationCompletedEventHandler>(
-        [idx](ICoreWebView2* s, ICoreWebView2NavigationCompletedEventArgs*)->HRESULT {
+        [win, tabId](ICoreWebView2* s, ICoreWebView2NavigationCompletedEventArgs*)->HRESULT {
+            if (!WinAlive(win)) return S_OK;
+            int i = TabIndexById(win, tabId); if (i < 0) return S_OK;
             if (s) {
-                s->ExecuteScript(L"(function(){try{document.documentElement.style.background='#000'}catch(e){};try{if(document.body)document.body.style.background='#000'}catch(e){}})();", nullptr);
-                LPWSTR src = nullptr; if (SUCCEEDED(s->get_Source(&src))) {
-                    std::wstring url = src ? src : L""; g_tabs[idx].lastUri = url; AddToHistory(url);
-                    if (idx == g_active && !(GetFocus() == g_editUrl && g_editDirty)) { g_settingUrl = true; SetWindowTextW(g_editUrl, url.c_str()); g_settingUrl = false; }
+                LPWSTR src = nullptr;
+                if (SUCCEEDED(s->get_Source(&src))) {
+                    std::wstring url = src ? src : L"";
+                    win->tabs[i].lastUri = url;
+                    AddToHistory(url);
+                    if (i == win->active && !(GetFocus() == win->editUrl && win->editDirty)) {
+                        win->settingUrl = true;
+                        SetWindowTextW(win->editUrl, url.c_str());
+                        win->settingUrl = false;
+                    }
                     if (src) CoTaskMemFree(src);
                 }
+            }
+
+            if (i == win->active) {
+                win->isLoading = false;
+                UpdateReloadButton(win);
             }
             return S_OK;
         }).Get(), nullptr);
 
     web->add_NewWindowRequested(Microsoft::WRL::Callback<ICoreWebView2NewWindowRequestedEventHandler>(
-        [](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* a)->HRESULT {
-            LPWSTR uri = nullptr; a->get_Uri(&uri); NewTab(uri ? uri : L"about:blank"); if (uri) CoTaskMemFree(uri); a->put_Handled(TRUE); return S_OK;
+        [win](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* a)->HRESULT {
+            LPWSTR uri = nullptr;
+            a->get_Uri(&uri);
+            if (WinAlive(win)) NewTab(win, uri ? uri : L"about:blank");
+            if (uri) CoTaskMemFree(uri);
+            a->put_Handled(TRUE);
+            return S_OK;
         }).Get(), nullptr);
 
-    ctl->add_AcceleratorKeyPressed(Microsoft::WRL::Callback<ICoreWebView2AcceleratorKeyPressedEventHandler>(
-        [](ICoreWebView2Controller*, ICoreWebView2AcceleratorKeyPressedEventArgs* args)->HRESULT {
+    ComPtr<ICoreWebView2_8> web8;
+    if (SUCCEEDED(web.As(&web8))) {
+        web8->add_DownloadStarting(Microsoft::WRL::Callback<ICoreWebView2DownloadStartingEventHandler>(
+            [](ICoreWebView2* /*s*/, ICoreWebView2DownloadStartingEventArgs* /*args*/)->HRESULT {
+                return S_OK;
+            }).Get(), nullptr);
+    }
+
+    win->tabs[idx].ctl->add_AcceleratorKeyPressed(Microsoft::WRL::Callback<ICoreWebView2AcceleratorKeyPressedEventHandler>(
+        [win](ICoreWebView2Controller*, ICoreWebView2AcceleratorKeyPressedEventArgs* args)->HRESULT {
             UINT vk = 0; args->get_VirtualKey(&vk);
             COREWEBVIEW2_KEY_EVENT_KIND kind; args->get_KeyEventKind(&kind);
-            if (kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN && kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN) return S_OK;
+            if (kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN &&
+                kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN)
+                return S_OK;
 
             bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
-
-            if (HandleGlobalShortcut(vk, ctrl, shift, alt)) {
+            if (WinAlive(win) && HandleGlobalShortcut(win, vk, ctrl, shift, alt)) {
                 args->put_Handled(TRUE);
                 return S_OK;
             }
             return S_OK;
         }).Get(), nullptr);
+
+    // --- Favicon support: ICoreWebView2_15 ---
+    ComPtr<ICoreWebView2_15> web15;
+    if (SUCCEEDED(web.As(&web15))) {
+        web15->add_FaviconChanged(
+            Microsoft::WRL::Callback<ICoreWebView2FaviconChangedEventHandler>(
+                [win, tabId](ICoreWebView2* sender, IUnknown*) -> HRESULT {
+                    if (!sender || !WinAlive(win)) return S_OK;
+
+                    Microsoft::WRL::ComPtr<ICoreWebView2_15> wv15;
+                    if (FAILED(sender->QueryInterface(IID_PPV_ARGS(&wv15)))) return S_OK;
+
+                    return wv15->GetFavicon(
+                        COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG,
+                        Microsoft::WRL::Callback<ICoreWebView2GetFaviconCompletedHandler>(
+                            [win, tabId](HRESULT hr, IStream* iconStream) -> HRESULT {
+                                if (FAILED(hr)) return S_OK;
+
+                                HICON newIcon = nullptr;
+
+                                if (iconStream) {
+                                    Gdiplus::Bitmap bmp(iconStream);
+                                    if (bmp.GetLastStatus() == Gdiplus::Ok) {
+                                        HICON hc = nullptr;
+                                        if (bmp.GetHICON(&hc) == Gdiplus::Status::Ok) {
+                                            newIcon = hc;
+                                        }
+                                    }
+                                }
+
+                                int i = WinAlive(win) ? TabIndexById(win, tabId) : -1;
+                                if (i >= 0) {
+                                    Tab& t = win->tabs[i];
+                                    if (t.favicon) { DestroyIcon(t.favicon); t.favicon = nullptr; }
+                                    t.favicon = newIcon;
+                                    if (t.btn) InvalidateRect(t.btn, nullptr, TRUE);
+                                }
+                                else if (newIcon) {
+                                    DestroyIcon(newIcon);
+                                }
+                                return S_OK;
+                            }).Get());
+                }).Get(),
+                    nullptr);
+    }
 }
 
-static void CreateWebViewForTab(int idx) {
-    if (idx < 0 || idx >= (int)g_tabs.size() || g_tabs[idx].ctl) return;
-    CreateCoreWebView2EnvironmentWithOptions(nullptr, L".\\wv2_userdata", nullptr,
+// Helper to ensure Environment is created once (shared across all windows)
+static void EnsureWebViewEnv(std::function<void()> onReady) {
+    if (g_env) {
+        onReady();
+        return;
+    }
+    g_envPendingCallbacks.push_back(onReady);
+    if (g_envCreating) return;
+
+    g_envCreating = true;
+    std::wstring userData = WebViewProfilePath();
+
+    CreateCoreWebView2EnvironmentWithOptions(nullptr, userData.c_str(), nullptr,
         Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-            [idx](HRESULT hr, ICoreWebView2Environment* env)->HRESULT {
-                if (FAILED(hr) || !env) return hr ? hr : E_FAIL;
-                return env->CreateCoreWebView2Controller(g_client,
-                    Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                        [idx](HRESULT hr2, ICoreWebView2Controller* ctl)->HRESULT {
-                            if (FAILED(hr2) || !ctl) return hr2 ? hr2 : E_FAIL;
-                            g_tabs[idx].ctl = ctl; ctl->get_CoreWebView2(&g_tabs[idx].web);
-                            RECT rc; GetClientRect(g_client, &rc);
-                            RECT b = { kMargin,kTabBarH + kToolbarH,rc.right - kMargin,rc.bottom - kMargin };
-                            ctl->put_Bounds(b); ctl->put_IsVisible(FALSE);
-                            WireTabEvents(idx);
-                            if (!g_tabs[idx].pendingUri.empty()) g_tabs[idx].web->Navigate(g_tabs[idx].pendingUri.c_str());
-                            else g_tabs[idx].web->Navigate(L"https://google.com/");
-                            if (idx == g_active) {
-                                LayoutActiveWebView();
-                                if (g_tabs[idx].ctl) {
-                                    g_tabs[idx].ctl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
-                                }
-                            }
-                            return S_OK;
-                        }).Get());
+            [](HRESULT hr, ICoreWebView2Environment* env)->HRESULT {
+                g_envCreating = false;
+                if (SUCCEEDED(hr) && env) {
+                    g_env = env;
+                    for (auto& cb : g_envPendingCallbacks) cb();
+                }
+                g_envPendingCallbacks.clear();
+                return S_OK;
             }).Get());
+}
+
+static void CreateWebViewForTab(BrowserWindow* win, int tabId) {
+    int idx = TabIndexById(win, tabId);
+    if (idx < 0 || win->tabs[idx].ctl) return;
+
+    EnsureWebViewEnv([win, tabId]() {
+        if (!WinAlive(win) || !g_env) return;
+        int i = TabIndexById(win, tabId);
+        if (i < 0 || win->tabs[i].ctl) return;
+
+        g_env->CreateCoreWebView2Controller(win->client,
+            Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                [win, tabId](HRESULT hr2, ICoreWebView2Controller* ctl)->HRESULT {
+                    if (FAILED(hr2) || !ctl) return hr2 ? hr2 : E_FAIL;
+                    if (!WinAlive(win)) { ctl->Close(); return S_OK; }
+                    int i = TabIndexById(win, tabId);
+                    if (i < 0) { ctl->Close(); return S_OK; }
+
+                    win->tabs[i].ctl = ctl;
+                    ctl->get_CoreWebView2(&win->tabs[i].web);
+
+                    ComPtr<ICoreWebView2> wv = win->tabs[i].web;
+                    ComPtr<ICoreWebView2_13> wv13;
+                    if (SUCCEEDED(wv.As(&wv13))) {
+                        ComPtr<ICoreWebView2Profile> prof;
+                        if (SUCCEEDED(wv13->get_Profile(&prof)) && prof) {
+                            ComPtr<ICoreWebView2Profile2> prof2;
+                            if (SUCCEEDED(prof.As(&prof2)) && prof2) {
+                                prof2->put_PreferredColorScheme(COREWEBVIEW2_PREFERRED_COLOR_SCHEME_DARK);
+                            }
+                        }
+                    }
+
+                    RECT rc; GetClientRect(win->client, &rc);
+                    RECT b = { kMargin,kTabBarH + kToolbarH,rc.right - kMargin,rc.bottom - kMargin };
+                    ctl->put_Bounds(b);
+                    ctl->put_IsVisible(FALSE);
+
+                    WireTabEvents(win, tabId);
+
+                    if (!win->tabs[i].pendingUri.empty()) win->tabs[i].web->Navigate(win->tabs[i].pendingUri.c_str());
+                    else win->tabs[i].web->Navigate(L"https://google.com/");
+
+                    if (i == win->active) {
+                        LayoutActiveWebView(win);
+                        if (win->tabs[i].ctl) win->tabs[i].ctl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                    }
+                    return S_OK;
+                }).Get());
+        });
 }
 
 // ---------- procs ----------
 static LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_CREATE: {
-        INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES }; InitCommonControlsEx(&icc);
-        if (!g_brBlack) g_brBlack = CreateSolidBrush(g_colBg);
-        if (!g_font)    g_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-        if (!g_brPanel) g_brPanel = CreateSolidBrush(g_colPanel);
-        if (!g_brEdit)  g_brEdit = CreateSolidBrush(g_colBg);
-
-        g_tabBar = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, (HMENU)IDC_TABBAR, g_hInst, nullptr);
-
-        LayoutToolbarAndTabs();
-
-        g_tabs.clear(); g_tabs.push_back(Tab{}); g_active = 0;
-
-        LoadHistory();
-
-        SetWindowSubclass(g_editUrl, EditSubproc, 1, 0);
-
-        PostMessage(hwnd, WM_APP_INIT_WEBVIEW, 0, 0);
-        return 0;
+    if (msg == WM_NCCREATE) {
+        CREATESTRUCT* cs = (CREATESTRUCT*)lParam;
+        SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+        return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 
+    BrowserWindow* self = (BrowserWindow*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    if (!self) return DefWindowProc(hwnd, msg, wParam, lParam);
+
+    switch (msg) {
     case WM_ERASEBKGND: {
         RECT r; GetClientRect(hwnd, &r);
         FillRect((HDC)wParam, &r, g_brBlack ? g_brBlack : (HBRUSH)GetStockObject(BLACK_BRUSH));
         return 1;
     }
-
-    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wParam; SetTextColor(dc, g_colText);
+        if ((HWND)lParam == self->tabBar) { SetBkColor(dc, g_colBg); return (LRESULT)(g_brBlack ? g_brBlack : GetStockObject(BLACK_BRUSH)); }
+        SetBkColor(dc, g_colPanel); return (LRESULT)(g_brPanel ? g_brPanel : GetStockObject(BLACK_BRUSH));
+    }
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORBTN:
     case WM_CTLCOLORLISTBOX: {
@@ -507,157 +1021,225 @@ static LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         if (msg == WM_CTLCOLOREDIT) { SetBkColor(dc, g_colBg); return (LRESULT)g_brEdit; }
         SetBkColor(dc, g_colPanel); return (LRESULT)g_brPanel;
     }
-
     case WM_DRAWITEM: {
-        const DRAWITEMSTRUCT* dis = (const DRAWITEMSTRUCT*)lParam; if (!dis) break;
+        const DRAWITEMSTRUCT* dis = (const DRAWITEMSTRUCT*)lParam;
+        if (!dis) break;
         if (dis->CtlID == IDC_SUGGEST) return FALSE;
-        bool isTab = false, isActive = false; UINT id = (UINT)GetDlgCtrlID(dis->hwndItem);
-        if (id >= (UINT)WM_APP_SWITCH_TAB && id < (UINT)WM_APP_SWITCH_TAB + 0x1000) { isTab = true; int idx = (int)(id - WM_APP_SWITCH_TAB); isActive = (idx == g_active); }
-        DrawOwnerButton(dis, isTab, isActive); return TRUE;
+
+        bool isTab = false, isActive = false;
+        HICON hIcon = nullptr;
+        UINT id = (UINT)GetDlgCtrlID(dis->hwndItem);
+
+        if (id >= (UINT)WM_APP_SWITCH_TAB && id < (UINT)WM_APP_SWITCH_TAB + 0x1000) {
+            isTab = true;
+            int idx = (int)(id - WM_APP_SWITCH_TAB);
+            isActive = (idx == self->active);
+            if (idx >= 0 && idx < (int)self->tabs.size()) {
+                hIcon = self->tabs[idx].favicon;
+            }
+        }
+
+        DrawOwnerButton(dis, isTab, isActive, hIcon);
+        return TRUE;
     }
 
     case WM_APP_INIT_WEBVIEW:
-        if (g_active >= 0 && g_active < (int)g_tabs.size() && !g_tabs[g_active].ctl) CreateWebViewForTab(g_active);
+        if (self->active >= 0 && self->active < (int)self->tabs.size() && !self->tabs[self->active].ctl)
+            CreateWebViewForTab(self, self->tabs[self->active].id);
         return 0;
-
     case WM_SIZE:
-        LayoutToolbarAndTabs();
-        if (g_suggestVisible) { int cnt = (int)SendMessageW(g_suggest, LB_GETCOUNT, 0, 0); if (cnt > 0) PositionSuggestBelowEdit(cnt); }
+        LayoutToolbarAndTabs(self);
+        if (self->suggestVisible) { int cnt = (int)SendMessageW(self->suggest, LB_GETCOUNT, 0, 0); if (cnt > 0) PositionSuggestBelowEdit(self, cnt); }
         return 0;
-
-        // Global hotkey (Ctrl+L)
-    case WM_HOTKEY:
-        if (wParam == HK_CTRLL) {
-            if (g_editUrl) { SetFocus(g_editUrl); SendMessageW(g_editUrl, EM_SETSEL, 0, -1); g_editDirty = true; HideSuggestions(); }
-            return 0;
-        }
-        break;
-
     case WM_KEYDOWN: {
         bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
-
-        // Enter in URL box (existing)
-        if (wParam == VK_RETURN && GetFocus() == g_editUrl) { g_editDirty = false; NavigateFromUrlBox(); return 0; }
-
-        // Global shortcuts (backstop)
-        if (HandleGlobalShortcut(wParam, ctrl, shift, alt)) return 0;
-
+        if (wParam == VK_RETURN && GetFocus() == self->editUrl) { self->editDirty = false; NavigateFromUrlBox(self); return 0; }
+        if (HandleGlobalShortcut(self, wParam, ctrl, shift, alt)) return 0;
         break;
     }
-
     case WM_COMMAND: {
         int id = LOWORD(wParam), code = HIWORD(wParam);
-
         if (id == IDC_URL) {
             if (code == EN_CHANGE) {
-                if (!g_settingUrl && GetFocus() == g_editUrl) {
-                    g_editDirty = true;
-                    wchar_t q[2048] = L""; GetWindowTextW(g_editUrl, q, 2048);
-                    PopulateSuggestions(q);
+                if (!self->settingUrl && GetFocus() == self->editUrl) { self->editDirty = true; wchar_t q[2048] = L""; GetWindowTextW(self->editUrl, q, 2048); PopulateSuggestions(self, q); }
+                return 0;
+            }
+            if (code == EN_KILLFOCUS) { self->editDirty = false; return 0; }
+        }
+        if (id == IDC_SUGGEST) {
+            if (code == LBN_SELCHANGE) { ApplySuggestSelectionToEdit(self); return 0; }
+            if (code == LBN_DBLCLK) { CommitSuggestion(self, true); return 0; }
+            if (code == LBN_KILLFOCUS) { if (GetFocus() != self->editUrl) HideSuggestions(self); return 0; }
+        }
+        if (code == BN_CLICKED) {
+            if (id == IDC_BACK) {
+                if (self->active >= 0 && self->tabs[self->active].web) self->tabs[self->active].web->GoBack();
+                return 0;
+            }
+            if (id == IDC_FWD) {
+                if (self->active >= 0 && self->tabs[self->active].web) self->tabs[self->active].web->GoForward();
+                return 0;
+            }
+            if (id == IDC_RELOAD) {
+                if (self->active >= 0 && self->tabs[self->active].web) {
+                    if (self->isLoading) self->tabs[self->active].web->Stop();
+                    else self->tabs[self->active].web->Reload();
                 }
                 return 0;
             }
-            if (code == EN_KILLFOCUS) { g_editDirty = false; return 0; }
+            if (id == IDC_CLOSE_TAB) {
+                CloseActiveTab(self);
+                return 0;
+            }
+            if (id == IDC_NEW_TAB) {
+                NewTab(self);
+                return 0;
+            }
         }
-
-        if (id == IDC_SUGGEST) {
-            if (code == LBN_DBLCLK) { CommitSuggestion(true); return 0; }
-            if (code == LBN_KILLFOCUS) { if (GetFocus() != g_editUrl) HideSuggestions(); return 0; }
-        }
-
-        if (id == IDC_GO && code == BN_CLICKED) { g_editDirty = false; NavigateFromUrlBox(); return 0; }
-        if (id == IDC_BACK && code == BN_CLICKED) { if (g_active >= 0 && g_tabs[g_active].web) g_tabs[g_active].web->GoBack(); return 0; }
-        if (id == IDC_FWD && code == BN_CLICKED) { if (g_active >= 0 && g_tabs[g_active].web) g_tabs[g_active].web->GoForward(); return 0; }
-
-        if (id == IDC_NEW_TAB && code == BN_CLICKED) { NewTab(); return 0; }
-
-        if (id >= (int)WM_APP_SWITCH_TAB && id < (int)WM_APP_SWITCH_TAB + 1024) {
-            int idx = id - WM_APP_SWITCH_TAB; if (idx < (int)g_tabs.size()) SwitchToTab(idx); return 0;
-        }
+        if (id >= (int)WM_APP_SWITCH_TAB && id < (int)WM_APP_SWITCH_TAB + 1024) { int idx = id - WM_APP_SWITCH_TAB; if (idx < (int)self->tabs.size()) SwitchToTab(self, idx); return 0; }
         break;
     }
-
     case WM_CLOSE: ShowWindow(GetParent(hwnd), SW_HIDE); return 0;
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
 static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    BrowserWindow* self = WinFromFrame(hwnd);
+    WNDPROC prev = self ? self->prevFrameProc : nullptr;
     switch (msg) {
+    case WM_SHOWWINDOW: if (wParam && self && self->client) PostMessage(self->client, WM_APP_INIT_WEBVIEW, 0, 0); break;
     case WM_ERASEBKGND: { RECT r; GetClientRect(hwnd, &r); FillRect((HDC)wParam, &r, g_brBlack ? g_brBlack : (HBRUSH)GetStockObject(BLACK_BRUSH)); return 1; }
-    case WM_SIZE:
-        if (g_client) { RECT fr; GetClientRect(hwnd, &fr); SetWindowPos(g_client, 0, 8, 24, fr.right - 8, fr.bottom - 24, SWP_NOZORDER | SWP_NOACTIVATE); }
-        break;
-    case WM_NCDESTROY:
-        if (g_prevFrameProc) { SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)g_prevFrameProc); g_prevFrameProc = nullptr; }
-        break;
+    case WM_SIZE: if (self && self->client) { RECT fr; GetClientRect(hwnd, &fr); SetWindowPos(self->client, 0, 8, 24, fr.right - 8, fr.bottom - 24, SWP_NOZORDER | SWP_NOACTIVATE); } break;
+    case WM_NCDESTROY: if (self && self->prevFrameProc) { SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)self->prevFrameProc); self->prevFrameProc = nullptr; } break;
     }
-    return g_prevFrameProc ? CallWindowProc(g_prevFrameProc, hwnd, msg, wParam, lParam) : DefWindowProc(hwnd, msg, wParam, lParam);
+    return prev ? CallWindowProc(prev, hwnd, msg, wParam, lParam) : DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
 // ---- Winamp plumbing ----
-static HWND CreateEmbeddedFrame(HWND wa) {
-    g_ews.flags |= EMBED_FLAGS_NOWINDOWMENU;
-    g_ews.r.left = 200; g_ews.r.top = 200; g_ews.r.right = 1200; g_ews.r.bottom = 900;
-    SET_EMBED_GUID((&g_ews), kEmbedGuid);
-    return (HWND)SendMessage(wa, WM_WA_IPC, (WPARAM)&g_ews, IPC_GET_EMBEDIF);
+static BrowserWindow* CreateBrowserWindow(bool show)
+{
+    EnsureGlobals();
+
+    auto up = std::make_unique<BrowserWindow>();
+    BrowserWindow* win = up.get();
+    g_windows.push_back(std::move(up));
+
+    // Each window gets its own GUID so Winamp/skin engine can tell frames apart.
+    if (FAILED(CoCreateGuid(&win->guid))) win->guid = {};
+    win->ews = {};
+    win->embedFrame = CreateEmbeddedWindow(&win->ews, win->guid);
+    if (!win->embedFrame) {
+        g_windows.pop_back();
+        return nullptr;
+    }
+    SetWindowTextW(win->embedFrame, L"Exodium");
+    win->prevFrameProc = (WNDPROC)SetWindowLongPtr(win->embedFrame, GWLP_WNDPROC, (LONG_PTR)FrameProc);
+
+    // Cascade additional windows so they don't stack exactly on the first.
+    if (g_windows.size() > 1) {
+        RECT wr; GetWindowRect(win->embedFrame, &wr);
+        int off = (int)(g_windows.size() - 1) * 30;
+        SetWindowPos(win->embedFrame, nullptr, wr.left + off, wr.top + off, 0, 0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    RECT fr; GetClientRect(win->embedFrame, &fr);
+    win->client = CreateWindowExW(0, L"ExodiumClient", L"", WS_CHILD | WS_VISIBLE,
+        8, 24, fr.right - 8, fr.bottom - 24,
+        win->embedFrame, nullptr, g_hInst, win);
+
+    // Initial tab
+    win->tabs.push_back(Tab{});
+    win->tabs[0].id = win->nextTabId++;
+    win->active = 0;
+    LayoutToolbarAndTabs(win);
+
+    // Per-window menu entry so each window can be toggled from Winamp.
+    win->menuId = (UINT_PTR)SendMessage(plugin.hwndParent, WM_WA_IPC, 0, IPC_REGISTER_LOWORD_COMMAND);
+    wchar_t menuTitle[] = L"Exodium";
+    AddEmbeddedWindowToMenus(TRUE, (UINT)win->menuId, menuTitle, show ? TRUE : FALSE);
+
+    if (show) ShowWindow(win->embedFrame, SW_SHOWNA);
+    PostMessage(win->client, WM_APP_INIT_WEBVIEW, 0, 0);
+    return win;
+}
+
+static void DestroyBrowserWindow(BrowserWindow* win)
+{
+    for (auto& t : win->tabs) {
+        if (t.ctl) t.ctl->Close();
+        t.web.Reset();
+        if (t.btn) DestroyWindow(t.btn);
+        if (t.favicon) { DestroyIcon(t.favicon); t.favicon = nullptr; }
+    }
+    win->tabs.clear();
+
+    if (win->suggest) { DestroyWindow(win->suggest); win->suggest = nullptr; }
+    if (win->client) { DestroyWindow(win->client); win->client = nullptr; }
+
+    AddEmbeddedWindowToMenus(FALSE, (UINT)win->menuId, nullptr, FALSE);
+
+    if (win->embedFrame) {
+        if (win->prevFrameProc) SetWindowLongPtr(win->embedFrame, GWLP_WNDPROC, (LONG_PTR)win->prevFrameProc);
+        DestroyWindow(win->embedFrame); win->embedFrame = nullptr;
+    }
+    DestroyEmbeddedWindow(&win->ews);
 }
 
 static int  __cdecl init();
 static void __cdecl quit();
 static void __cdecl config();
 
-static winampGeneralPurposePlugin plugin = {
-  GPPHDR_VER, (char*)"exodium (Stage 9c)", init, config, quit, 0, 0
+winampGeneralPurposePlugin plugin = {
+  GPPHDR_VER, (char*)"Exodium", init, config, quit, 0, 0
 };
 extern "C" __declspec(dllexport) winampGeneralPurposePlugin* winampGetGeneralPurposePlugin() { return &plugin; }
 
-static int __cdecl init() {
+static int __cdecl init()
+{
     g_hInst = (HINSTANCE)plugin.hDllInstance;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+    Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, nullptr);
 
-    if (!g_brBlack) g_brBlack = CreateSolidBrush(g_colBg);
-    if (!g_font)    g_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    if (!g_brPanel) g_brPanel = CreateSolidBrush(g_colPanel);
-    if (!g_brEdit)  g_brEdit = CreateSolidBrush(g_colBg);
+    EnsureGlobals();
+    HookWinampParent();
+    CreateBrowserWindow(false);  // first window, hidden until shown via menu/config
 
-    g_embedFrame = CreateEmbeddedFrame(plugin.hwndParent);
-    if (!g_embedFrame) return 0;
-
-    g_prevFrameProc = (WNDPROC)SetWindowLongPtr(g_embedFrame, GWLP_WNDPROC, (LONG_PTR)FrameProc);
-
-    WNDCLASSW wc = {}; wc.lpfnWndProc = ClientProc; wc.hInstance = g_hInst; wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH); wc.lpszClassName = L"ExodiumClient";
-    RegisterClassW(&wc);
-
-    RECT fr; GetClientRect(g_embedFrame, &fr);
-    g_client = CreateWindowExW(0, L"ExodiumClient", L"", WS_CHILD | WS_VISIBLE, 8, 24, fr.right - 8, fr.bottom - 24, g_embedFrame, nullptr, g_hInst, nullptr);
-
-    // Ctrl+L hotkey
-    RegisterHotKey(g_client, HK_CTRLL, MOD_CONTROL, 'L');
-
-    LoadHistory();
-
-    ShowWindow(g_embedFrame, SW_SHOW);
     return 0;
 }
-static void __cdecl config() { if (g_embedFrame) ShowWindow(g_embedFrame, SW_SHOWNA); }
 
-static void __cdecl quit() {
+static void __cdecl config()
+{
+    // Show (or create) the first window.
+    if (g_windows.empty()) { CreateBrowserWindow(true); return; }
+    BrowserWindow* win = g_windows.front().get();
+    if (win->embedFrame) ShowWindow(win->embedFrame, SW_SHOWNA);
+    if (win->client) PostMessage(win->client, WM_APP_INIT_WEBVIEW, 0, 0);
+}
+
+static void __cdecl quit()
+{
     SaveHistory();
-    if (g_client) UnregisterHotKey(g_client, HK_CTRLL);
 
-    for (auto& t : g_tabs) { if (t.ctl) t.ctl->Close(); t.web.Reset(); if (t.btn) DestroyWindow(t.btn); }
-    g_tabs.clear();
-    if (g_suggest) { DestroyWindow(g_suggest); g_suggest = nullptr; }
-    if (g_client) { DestroyWindow(g_client); g_client = nullptr; }
-    if (g_embedFrame) {
-        if (g_prevFrameProc) SetWindowLongPtr(g_embedFrame, GWLP_WNDPROC, (LONG_PTR)g_prevFrameProc);
-        DestroyWindow(g_embedFrame); g_embedFrame = nullptr;
+    for (auto& w : g_windows) DestroyBrowserWindow(w.get());
+    g_windows.clear();
+
+    if (g_env) { g_env.Reset(); }
+
+    if (g_oldWaProc) {
+        SetWindowLongPtr(plugin.hwndParent, GWLP_WNDPROC, (LONG_PTR)g_oldWaProc); g_oldWaProc = nullptr;
     }
+
     if (g_brBlack) { DeleteObject(g_brBlack); g_brBlack = nullptr; }
     if (g_brPanel) { DeleteObject(g_brPanel); g_brPanel = nullptr; }
     if (g_brEdit) { DeleteObject(g_brEdit);  g_brEdit = nullptr; }
+    if (g_gdiplusToken) {
+        Gdiplus::GdiplusShutdown(g_gdiplusToken);
+        g_gdiplusToken = 0;
+    }
     CoUninitialize();
 }

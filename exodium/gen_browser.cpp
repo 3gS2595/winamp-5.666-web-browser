@@ -107,6 +107,9 @@ struct BrowserWindow {
     embedWindowState ews = { 0 };
     UINT_PTR menuId = (UINT_PTR)-1;
     GUID guid = {};
+
+    bool isFullscreen = false;
+    RECT savedFrameRect{};
 };
 
 static std::vector<std::unique_ptr<BrowserWindow>> g_windows;
@@ -200,6 +203,8 @@ static LRESULT CALLBACK WaSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 static void NewTab(BrowserWindow* win, const wchar_t* url = L"https://google.com/");
 static void CreateWebViewForTab(BrowserWindow* win, int tabId);
 static BrowserWindow* CreateBrowserWindow(bool show);
+static void EnterVideoFullscreen(BrowserWindow* win);
+static void ExitVideoFullscreen(BrowserWindow* win);
 
 static void FocusAddressBar(BrowserWindow* win) { SetFocus(win->editUrl); SendMessageW(win->editUrl, EM_SETSEL, 0, -1); }
 static std::wstring GetActiveUrl(BrowserWindow* win) {
@@ -595,7 +600,13 @@ static void LayoutActiveWebView(BrowserWindow* win) {
     if (win->active < 0 || win->active >= (int)win->tabs.size()) return;
     if (!win->tabs[win->active].ctl) return;
     RECT rc; GetClientRect(win->client, &rc);
-    int top = kTabBarH + kToolbarH; RECT b = { kMargin,top,rc.right - kMargin,rc.bottom - kMargin };
+    RECT b;
+    if (win->isFullscreen) {
+        b = { 0, 0, rc.right, rc.bottom };
+    } else {
+        int top = kTabBarH + kToolbarH;
+        b = { kMargin, top, rc.right - kMargin, rc.bottom - kMargin };
+    }
     win->tabs[win->active].ctl->put_Bounds(b); win->tabs[win->active].ctl->put_IsVisible(TRUE);
 }
 static void HideAllWebViews(BrowserWindow* win) { for (auto& t : win->tabs) if (t.ctl) t.ctl->put_IsVisible(FALSE); }
@@ -751,6 +762,53 @@ static void CloseTab(BrowserWindow* win, int idx) {
 static void CloseActiveTab(BrowserWindow* win) { CloseTab(win, win->active); }
 
 // ---------- webview wiring ----------
+static void SetToolbarControlsVisible(BrowserWindow* win, bool visible) {
+    int show = visible ? SW_SHOWNA : SW_HIDE;
+    if (win->tabBar) ShowWindow(win->tabBar, show);
+    if (win->newTabBtn) ShowWindow(win->newTabBtn, show);
+    for (auto& t : win->tabs) if (t.btn) ShowWindow(t.btn, show);
+    if (win->btnBack) ShowWindow(win->btnBack, show);
+    if (win->btnFwd) ShowWindow(win->btnFwd, show);
+    if (win->btnReload) ShowWindow(win->btnReload, show);
+    if (win->btnCloseTab) ShowWindow(win->btnCloseTab, show);
+    if (win->editUrl) ShowWindow(win->editUrl, show);
+    if (!visible) HideSuggestions(win);
+}
+
+static void EnterVideoFullscreen(BrowserWindow* win) {
+    if (win->isFullscreen || !win->embedFrame) return;
+
+    GetWindowRect(win->embedFrame, &win->savedFrameRect);
+
+    HMONITOR mon = MonitorFromWindow(win->embedFrame, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(MONITORINFO) };
+    if (!GetMonitorInfo(mon, &mi)) return;
+
+    win->isFullscreen = true;
+    SetToolbarControlsVisible(win, false);
+
+    SetWindowPos(win->embedFrame, HWND_TOPMOST,
+        mi.rcMonitor.left, mi.rcMonitor.top,
+        mi.rcMonitor.right - mi.rcMonitor.left,
+        mi.rcMonitor.bottom - mi.rcMonitor.top,
+        SWP_SHOWWINDOW);
+}
+
+static void ExitVideoFullscreen(BrowserWindow* win) {
+    if (!win->isFullscreen || !win->embedFrame) return;
+
+    win->isFullscreen = false;
+
+    SetWindowPos(win->embedFrame, HWND_NOTOPMOST,
+        win->savedFrameRect.left, win->savedFrameRect.top,
+        win->savedFrameRect.right - win->savedFrameRect.left,
+        win->savedFrameRect.bottom - win->savedFrameRect.top,
+        SWP_SHOWWINDOW);
+
+    SetToolbarControlsVisible(win, true);
+    LayoutToolbarAndTabs(win);
+}
+
 static void WireTabEvents(BrowserWindow* win, int tabId) {
     int idx = TabIndexById(win, tabId);
     if (idx < 0) return;
@@ -914,6 +972,21 @@ static void WireTabEvents(BrowserWindow* win, int tabId) {
                 }).Get(),
                     nullptr);
     }
+
+    // --- Fullscreen video support ---
+    web->add_ContainsFullScreenElementChanged(
+        Microsoft::WRL::Callback<ICoreWebView2ContainsFullScreenElementChangedEventHandler>(
+            [win, tabId](ICoreWebView2* sender, IUnknown*) -> HRESULT {
+                if (!sender || !WinAlive(win)) return S_OK;
+                int i = TabIndexById(win, tabId);
+                if (i < 0 || i != win->active) return S_OK;
+
+                BOOL fs = FALSE;
+                sender->get_ContainsFullScreenElement(&fs);
+                if (fs) EnterVideoFullscreen(win);
+                else ExitVideoFullscreen(win);
+                return S_OK;
+            }).Get(), nullptr);
 }
 
 // Helper to ensure Environment is created once (shared across all windows)
@@ -1112,7 +1185,14 @@ static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     switch (msg) {
     case WM_SHOWWINDOW: if (wParam && self && self->client) PostMessage(self->client, WM_APP_INIT_WEBVIEW, 0, 0); break;
     case WM_ERASEBKGND: { RECT r; GetClientRect(hwnd, &r); FillRect((HDC)wParam, &r, g_brBlack ? g_brBlack : (HBRUSH)GetStockObject(BLACK_BRUSH)); return 1; }
-    case WM_SIZE: if (self && self->client) { RECT fr; GetClientRect(hwnd, &fr); SetWindowPos(self->client, 0, 8, 24, fr.right - 8, fr.bottom - 24, SWP_NOZORDER | SWP_NOACTIVATE); } break;
+    case WM_SIZE: if (self && self->client) {
+        RECT fr; GetClientRect(hwnd, &fr);
+        if (self->isFullscreen) {
+            SetWindowPos(self->client, 0, 0, 0, fr.right, fr.bottom, SWP_NOZORDER | SWP_NOACTIVATE);
+        } else {
+            SetWindowPos(self->client, 0, 8, 24, fr.right - 8, fr.bottom - 24, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    } break;
     case WM_NCDESTROY: if (self && self->prevFrameProc) { SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)self->prevFrameProc); self->prevFrameProc = nullptr; } break;
     }
     return prev ? CallWindowProc(prev, hwnd, msg, wParam, lParam) : DefWindowProc(hwnd, msg, wParam, lParam);

@@ -109,8 +109,8 @@ struct BrowserWindow {
     GUID guid = {};
 
     bool isFullscreen = false;
-    RECT savedFrameRect{};
-    LONG_PTR savedStyle = 0;
+    HWND fsWnd = nullptr;      // dedicated borderless top-level window used while a tab is fullscreen
+    int fsTabId = -1;          // id of the tab whose controller is parented into fsWnd
 };
 
 static std::vector<std::unique_ptr<BrowserWindow>> g_windows;
@@ -335,6 +335,16 @@ static void EnsureGlobals()
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.lpszClassName = L"ExodiumClient";
     RegisterClassW(&wc);
+
+    // Plain, borderless top-level window used only while a video/page is fullscreen.
+    // The WebView2 controller is reparented into this instead of resizing the
+    // Winamp-owned embed frame, which avoids fighting Winamp's own window chrome.
+    WNDCLASSW wcfs = {};
+    wcfs.lpfnWndProc = DefWindowProcW;
+    wcfs.hInstance = g_hInst;
+    wcfs.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wcfs.lpszClassName = L"ExodiumFullscreen";
+    RegisterClassW(&wcfs);
 
     LoadHistory();
 
@@ -598,16 +608,11 @@ static void SubclassCtrlCommon(HWND h) { if (h) SetWindowSubclass(h, EditSubproc
 
 // ---------- layout ----------
 static void LayoutActiveWebView(BrowserWindow* win) {
+    if (win->isFullscreen) return; // bounds/parent are driven by the fullscreen window instead
     if (win->active < 0 || win->active >= (int)win->tabs.size()) return;
     if (!win->tabs[win->active].ctl) return;
     RECT rc; GetClientRect(win->client, &rc);
-    RECT b;
-    if (win->isFullscreen) {
-        b = { 0, 0, rc.right, rc.bottom };
-    } else {
-        int top = kTabBarH + kToolbarH;
-        b = { kMargin, top, rc.right - kMargin, rc.bottom - kMargin };
-    }
+    int top = kTabBarH + kToolbarH; RECT b = { kMargin,top,rc.right - kMargin,rc.bottom - kMargin };
     win->tabs[win->active].ctl->put_Bounds(b); win->tabs[win->active].ctl->put_IsVisible(TRUE);
 }
 static void HideAllWebViews(BrowserWindow* win) { for (auto& t : win->tabs) if (t.ctl) t.ctl->put_IsVisible(FALSE); }
@@ -686,6 +691,7 @@ static void UpdateTabTitle(BrowserWindow* win, int idx, const wchar_t* t) {
     if (win->tabs[idx].btn) SetWindowTextW(win->tabs[idx].btn, win->tabs[idx].title.c_str());
 }
 static void SwitchToTab(BrowserWindow* win, int idx) {
+    if (win->isFullscreen) return; // the active tab's controller is parented elsewhere right now
     if (idx < 0 || idx >= (int)win->tabs.size()) return;
     if (win->active == idx) return;
 
@@ -776,46 +782,62 @@ static void SetToolbarControlsVisible(BrowserWindow* win, bool visible) {
     if (!visible) HideSuggestions(win);
 }
 
+// Standard WebView2 fullscreen pattern (matches Microsoft's own WebView2Browser
+// sample): reparent the active tab's controller into a dedicated, plain,
+// borderless top-level window sized to the monitor, instead of resizing or
+// restyling the Winamp-owned embed frame. This avoids fighting Winamp's own
+// window chrome entirely, so there is no leftover title bar/border and no
+// frame-recalculation glitches on the first transition.
 static void EnterVideoFullscreen(BrowserWindow* win) {
-    if (win->isFullscreen || !win->embedFrame) return;
-
-    GetWindowRect(win->embedFrame, &win->savedFrameRect);
-    win->savedStyle = GetWindowLongPtr(win->embedFrame, GWL_STYLE);
+    if (win->isFullscreen) return;
+    int i = win->active;
+    if (i < 0 || i >= (int)win->tabs.size() || !win->tabs[i].ctl) return;
 
     HMONITOR mon = MonitorFromWindow(win->embedFrame, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = { sizeof(MONITORINFO) };
     if (!GetMonitorInfo(mon, &mi)) return;
+    int w = mi.rcMonitor.right - mi.rcMonitor.left;
+    int h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+
+    // WS_EX_TOOLWINDOW keeps it out of the taskbar/Alt-Tab list, matching how
+    // browsers don't add a separate taskbar entry for fullscreen video.
+    HWND fsWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"ExodiumFullscreen", L"",
+        WS_POPUP, mi.rcMonitor.left, mi.rcMonitor.top, w, h,
+        nullptr, nullptr, g_hInst, nullptr);
+    if (!fsWnd) return;
 
     win->isFullscreen = true;
+    win->fsWnd = fsWnd;
+    win->fsTabId = win->tabs[i].id;
     SetToolbarControlsVisible(win, false);
 
-    LONG_PTR fsStyle = win->savedStyle & ~(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
-    SetWindowLongPtr(win->embedFrame, GWL_STYLE, fsStyle);
+    ComPtr<ICoreWebView2Controller> ctl = win->tabs[i].ctl;
+    ctl->put_ParentWindow(fsWnd);
+    RECT b = { 0, 0, w, h };
+    ctl->put_Bounds(b);
+    ctl->put_IsVisible(TRUE);
+    ctl->NotifyParentWindowPositionChanged();
 
-    // HWND_TOP (not HWND_TOPMOST) brings it to front once without pinning it
-    // above every other window, so alt-tabbing away still works normally.
-    SetWindowPos(win->embedFrame, HWND_TOP,
-        mi.rcMonitor.left, mi.rcMonitor.top,
-        mi.rcMonitor.right - mi.rcMonitor.left,
-        mi.rcMonitor.bottom - mi.rcMonitor.top,
-        SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    ShowWindow(fsWnd, SW_SHOW);
+    SetForegroundWindow(fsWnd);
 }
 
 static void ExitVideoFullscreen(BrowserWindow* win) {
-    if (!win->isFullscreen || !win->embedFrame) return;
-
+    if (!win->isFullscreen) return;
     win->isFullscreen = false;
 
-    SetWindowLongPtr(win->embedFrame, GWL_STYLE, win->savedStyle);
+    int i = TabIndexById(win, win->fsTabId);
+    if (i >= 0 && win->tabs[i].ctl) {
+        ComPtr<ICoreWebView2Controller> ctl = win->tabs[i].ctl;
+        ctl->put_ParentWindow(win->client);
+        ctl->NotifyParentWindowPositionChanged();
+    }
+    win->fsTabId = -1;
 
-    SetWindowPos(win->embedFrame, nullptr,
-        win->savedFrameRect.left, win->savedFrameRect.top,
-        win->savedFrameRect.right - win->savedFrameRect.left,
-        win->savedFrameRect.bottom - win->savedFrameRect.top,
-        SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW);
+    if (win->fsWnd) { DestroyWindow(win->fsWnd); win->fsWnd = nullptr; }
 
     SetToolbarControlsVisible(win, true);
-    LayoutToolbarAndTabs(win);
+    LayoutToolbarAndTabs(win); // recomputes normal bounds via LayoutActiveWebView
 }
 
 static void WireTabEvents(BrowserWindow* win, int tabId) {
@@ -1194,14 +1216,7 @@ static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     switch (msg) {
     case WM_SHOWWINDOW: if (wParam && self && self->client) PostMessage(self->client, WM_APP_INIT_WEBVIEW, 0, 0); break;
     case WM_ERASEBKGND: { RECT r; GetClientRect(hwnd, &r); FillRect((HDC)wParam, &r, g_brBlack ? g_brBlack : (HBRUSH)GetStockObject(BLACK_BRUSH)); return 1; }
-    case WM_SIZE: if (self && self->client) {
-        RECT fr; GetClientRect(hwnd, &fr);
-        if (self->isFullscreen) {
-            SetWindowPos(self->client, 0, 0, 0, fr.right, fr.bottom, SWP_NOZORDER | SWP_NOACTIVATE);
-        } else {
-            SetWindowPos(self->client, 0, 8, 24, fr.right - 8, fr.bottom - 24, SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-    } break;
+    case WM_SIZE: if (self && self->client) { RECT fr; GetClientRect(hwnd, &fr); SetWindowPos(self->client, 0, 8, 24, fr.right - 8, fr.bottom - 24, SWP_NOZORDER | SWP_NOACTIVATE); } break;
     case WM_NCDESTROY: if (self && self->prevFrameProc) { SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)self->prevFrameProc); self->prevFrameProc = nullptr; } break;
     }
     return prev ? CallWindowProc(prev, hwnd, msg, wParam, lParam) : DefWindowProc(hwnd, msg, wParam, lParam);
@@ -1258,6 +1273,8 @@ static BrowserWindow* CreateBrowserWindow(bool show)
 
 static void DestroyBrowserWindow(BrowserWindow* win)
 {
+    if (win->fsWnd) { DestroyWindow(win->fsWnd); win->fsWnd = nullptr; }
+
     for (auto& t : win->tabs) {
         if (t.ctl) t.ctl->Close();
         t.web.Reset();

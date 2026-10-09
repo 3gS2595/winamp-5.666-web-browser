@@ -91,7 +91,7 @@ New `LoadSession()`, called from `init()` in place of the current unconditional
    - `SetWindowPos` the new `win->embedFrame` to the saved `x, y, w, h` (no
      `SWP_NOMOVE`/`SWP_NOSIZE`), overriding whatever position `CreateEmbeddedWindow`'s
      own (currently-broken) persistence or default cascade logic picked.
-   - Replace `win->tabs` with one `Tab{}` per saved URL: `id = win->nextTabId++`,
+   - Replace `win->tabs` with one `Tab{}` per saved URL: `id = g_nextTabId++`,
      `pendingUri = <url>`, `title = L"(tab)"` (will be updated once the page loads, same
      as any normal navigation).
    - Set `win->active` to the saved `activeIdx`, clamped to a valid range in case the

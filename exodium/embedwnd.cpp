@@ -21,10 +21,13 @@ HWND CreateEmbeddedWindow(embedWindowState* embedWindow, const GUID embedWindowG
 	// position of the embedded window when it is created saving addtional handling
 	//
 	// how you store the settings is down to you, this example uses winamp.ini for ease
-	embedWindow->r.left = GetPrivateProfileInt(INI_FILE_SECTION,L"xpos",275,ini_file);
-	embedWindow->r.top = GetPrivateProfileInt(INI_FILE_SECTION,L"ypos",406,ini_file);
-	embedWindow->r.right = embedWindow->r.left + GetPrivateProfileInt(INI_FILE_SECTION,L"width",275,ini_file);
-	embedWindow->r.bottom = embedWindow->r.top + GetPrivateProfileInt(INI_FILE_SECTION,L"height",232,ini_file);
+	//
+	// the default size is one a web page is usable at. it sits on the classic skin's
+	// resize grid (275 + 25n wide, 116 + 29n high)
+	embedWindow->r.left = GetPrivateProfileInt(INI_FILE_SECTION,L"xpos",80,ini_file);
+	embedWindow->r.top = GetPrivateProfileInt(INI_FILE_SECTION,L"ypos",60,ini_file);
+	embedWindow->r.right = embedWindow->r.left + GetPrivateProfileInt(INI_FILE_SECTION,L"width",900,ini_file);
+	embedWindow->r.bottom = embedWindow->r.top + GetPrivateProfileInt(INI_FILE_SECTION,L"height",638,ini_file);
 
 	height = GetPrivateProfileInt(INI_FILE_SECTION,L"ff_height",height,ini_file);
 	width = GetPrivateProfileInt(INI_FILE_SECTION,L"ff_width",width,ini_file);
@@ -134,6 +137,12 @@ void UpdateEmbeddedWindowsMenu(UINT menuId)
 	if (windows_menu) CheckMenuItem(windows_menu, menuId, MF_BYCOMMAND | (visible ? MF_CHECKED : MF_UNCHECKED));
 }
 
+void CheckEmbeddedWindowMenus(UINT menuId, BOOL checked)
+{
+	if (main_menu) CheckMenuItem(main_menu, menuId, MF_BYCOMMAND | (checked ? MF_CHECKED : MF_UNCHECKED));
+	if (windows_menu) CheckMenuItem(windows_menu, menuId, MF_BYCOMMAND | (checked ? MF_CHECKED : MF_UNCHECKED));
+}
+
 BOOL SetEmbeddedWindowMinimizedMode(HWND embeddedWindow, BOOL fMinimized)
 {
 	if (fMinimized == TRUE)
@@ -201,8 +210,12 @@ LRESULT HandleEmbeddedWindowWinampWindowMessages(HWND embedWnd, UINT menuId, emb
 		// item for the embedded window as applicable
 		if((message == WM_SYSCOMMAND || message == WM_COMMAND) && LOWORD(wParam) == menuId)
 		{
-			ShowWindow(embedWnd,(IsWindowVisible(embedWnd) ? SW_HIDE : SW_SHOW));
-			visible = !visible;
+			// picking a minimized window from the menu brings it back rather than hiding it
+			if (IsWindowVisible(embedWnd) && IsIconic(embedWnd)) ShowWindow(embedWnd,SW_RESTORE);
+			else ShowWindow(embedWnd,(IsWindowVisible(embedWnd) ? SW_HIDE : SW_SHOW));
+			// more than one embedded window shares 'visible', so it is taken from
+			// the window that was just toggled rather than flipped
+			visible = IsWindowVisible(embedWnd);
 			UpdateEmbeddedWindowsMenu(menuId);
 		}
 

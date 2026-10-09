@@ -140,7 +140,7 @@ git commit -m "Save visible window positions and tabs to session.txt on quit"
 - Modify: `exodium/gen_browser.cpp` (add near `LoadHistory` at line 170; call from `init()` at line 1396, replacing the current `CreateBrowserWindow(false)` call)
 
 **Interfaces:**
-- Consumes: `SessionFilePath()` and `TrimCRLF()` (from Task 1 / existing code), `CreateBrowserWindow(bool show) -> BrowserWindow*` (line 206 forward decl, defined line 1330), `LayoutToolbarAndTabs(BrowserWindow*)` (line 192 forward decl), `WM_APP_INIT_WEBVIEW` (line 53), `Tab` fields `id`, `pendingUri`, `title` (line 74-83), `BrowserWindow::nextTabId`, `::tabs`, `::active`, `::client`, `::embedFrame` (line 85-114).
+- Consumes: `SessionFilePath()` and `TrimCRLF()` (from Task 1 / existing code), `CreateBrowserWindow(bool show) -> BrowserWindow*` (line 206 forward decl, defined line 1330), `LayoutToolbarAndTabs(BrowserWindow*)` (line 192 forward decl), `WM_APP_INIT_WEBVIEW` (line 53), `Tab` fields `id`, `pendingUri`, `title` (line 74-83), `g_nextTabId` (global tab id counter), `BrowserWindow::tabs`, `::active`, `::client`, `::embedFrame` (line 85-114).
 - Produces: `LoadSession() -> void`, called once from `init()`.
 
 - [ ] **Step 1: Add a session-record struct and parser**
@@ -206,7 +206,7 @@ static void LoadSession() {
         win->tabs.clear();
         for (auto& url : rec.urls) {
             Tab t;
-            t.id = win->nextTabId++;
+            t.id = g_nextTabId++;
             t.pendingUri = url;
             t.title = L"(tab)";
             win->tabs.push_back(std::move(t));

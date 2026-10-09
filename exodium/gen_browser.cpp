@@ -15,6 +15,7 @@
 #include <windowsx.h>
 #include <commctrl.h>
 #include <shlwapi.h>
+#include <dwmapi.h>
 #include <wrl.h>
 #include <vector>
 #include <string>
@@ -26,6 +27,7 @@
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "dwmapi.lib")
 
 #include "gen.h"
 #include "wa_ipc.h"
@@ -36,8 +38,8 @@
 using namespace Gdiplus;
 using Microsoft::WRL::ComPtr;
 
-// FIX: LNK2001 error (unresolved external symbol "wchar_t * ini_file")
-// The embedwnd utility requires this global variable from the Winamp SDK context.
+// The embedwnd utility keeps the window position and size in this file. It is
+// pointed at winamp.ini in init().
 wchar_t* ini_file = nullptr;
 
 // ---- IDs / layout ----
@@ -49,9 +51,13 @@ enum : int {
     IDC_SUGGEST = 1200,
 };
 static const int  kTabBarH = 26, kToolbarH = 32;
+static const int  kTabW = 140, kTabMinW = 24;
 static const int  kBtnW = 64, kBtnGap = 6, kMargin = 6;
+static const int  kTabDetachSlop = 12; // how far above/below a tab strip a dragged tab still counts as on it
 static const UINT WM_APP_INIT_WEBVIEW = WM_APP + 42;
 static const UINT WM_APP_SWITCH_TAB = WM_APP + 43;
+static const UINT WM_APP_DROP_TAB = WM_APP + 44;
+static const UINT WM_APP_CLOSE_TAB = WM_APP + 45;
 
 static HINSTANCE g_hInst = nullptr;
 
@@ -80,6 +86,8 @@ struct Tab {
     std::wstring lastUri;
     HICON favicon = nullptr;
     int id = 0;                 // stable id for async event routing
+    bool creating = false;      // a controller is being created for this tab
+    bool loading = false;       // a navigation is in progress
 };
 
 struct BrowserWindow {
@@ -92,21 +100,22 @@ struct BrowserWindow {
     HWND btnBack = nullptr, btnFwd = nullptr, btnGo = nullptr, editUrl = nullptr;
     HWND btnReload = nullptr;
     HWND btnCloseTab = nullptr;
-    bool isLoading = false;
 
     HWND suggest = nullptr;
     bool suggestVisible = false;
 
     bool editDirty = false;
     bool settingUrl = false;
+    bool urlClickSelect = false;   // the click in progress is the one that focused the address bar
 
     std::vector<Tab> tabs;
     int active = -1;
-    int nextTabId = 1;
 
     embedWindowState ews = { 0 };
     UINT_PTR menuId = (UINT_PTR)-1;
     GUID guid = {};
+
+    bool minimized = false;        // the frame is minimized; its pages are told they are hidden
 
     bool isFullscreen = false;
     HWND fsWnd = nullptr;      // dedicated borderless top-level window used while a tab is fullscreen
@@ -114,6 +123,22 @@ struct BrowserWindow {
 };
 
 static std::vector<std::unique_ptr<BrowserWindow>> g_windows;
+
+// Tab ids are unique across all windows, so a tab keeps its id (and its event
+// routing) when it is dragged from one window to another.
+static int g_nextTabId = 1;
+
+// ---- tab drag (one at a time, shared across windows) ----
+struct TabDrag {
+    int tabId = 0;             // 0 = no tab is being pressed/dragged
+    HWND btn = nullptr;        // the pressed tab button; holds mouse capture
+    POINT grab = {};           // where inside the tab it was grabbed
+    bool dragging = false;     // moved far enough to count as a drag, not a click
+    HWND ghost = nullptr;      // floating copy of the tab that follows the cursor
+    HWND marker = nullptr;     // insertion mark shown in the tab strip under the cursor
+};
+static TabDrag g_drag;
+struct TabDrop { int tabId; POINT pt; POINT grab; };
 
 // ---- shared history / closed tabs ----
 static std::vector<std::wstring> g_history;
@@ -130,13 +155,14 @@ static BrowserWindow* WinFromFrame(HWND frame) {
     return nullptr;
 }
 static BrowserWindow* WinFromChild(HWND child) { return WinFromClient(GetParent(child)); }
-static bool WinAlive(BrowserWindow* win) {
-    for (auto& w : g_windows) if (w.get() == win) return true;
-    return false;
-}
 static int TabIndexById(BrowserWindow* win, int id) {
     for (int i = 0; i < (int)win->tabs.size(); ++i) if (win->tabs[i].id == id) return i;
     return -1;
+}
+// The window a tab currently lives in, or null once the tab is gone.
+static BrowserWindow* WinFromTabId(int id) {
+    for (auto& w : g_windows) if (TabIndexById(w.get(), id) >= 0) return w.get();
+    return nullptr;
 }
 
 // ---------- persistence ----------
@@ -203,9 +229,14 @@ static LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 static LRESULT CALLBACK WaSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static void NewTab(BrowserWindow* win, const wchar_t* url = L"https://google.com/");
 static void CreateWebViewForTab(BrowserWindow* win, int tabId);
-static BrowserWindow* CreateBrowserWindow(bool show);
+static BrowserWindow* CreateBrowserWindow(bool show, const RECT* place = nullptr, bool forDroppedTab = false);
+static LRESULT CALLBACK TabButtonSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR);
+static LRESULT CALLBACK TabGhostProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+static void EndTabDrag();
 static void EnterVideoFullscreen(BrowserWindow* win);
 static void ExitVideoFullscreen(BrowserWindow* win);
+static void LeaveVideoFullscreen(BrowserWindow* win);
+static LRESULT CALLBACK FullscreenProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 static void FocusAddressBar(BrowserWindow* win) { SetFocus(win->editUrl); SendMessageW(win->editUrl, EM_SETSEL, 0, -1); }
 static std::wstring GetActiveUrl(BrowserWindow* win) {
@@ -214,17 +245,16 @@ static std::wstring GetActiveUrl(BrowserWindow* win) {
 }
 static void UpdateUrlBox(BrowserWindow* win) {
     if (GetFocus() == win->editUrl && win->editDirty) return;
-    if (win->active < 0 || win->active >= (int)win->tabs.size() || !win->tabs[win->active].web) return;
-    LPWSTR uri = nullptr;
-    if (SUCCEEDED(win->tabs[win->active].web->get_Source(&uri))) {
-        win->settingUrl = true; SetWindowTextW(win->editUrl, uri ? uri : L""); win->settingUrl = false;
-        if (uri) CoTaskMemFree(uri);
-    }
+    if (win->active < 0 || win->active >= (int)win->tabs.size()) return;
+    // A tab whose webview isn't up yet shows where it is headed.
+    std::wstring url = win->tabs[win->active].web ? GetActiveUrl(win) : win->tabs[win->active].pendingUri;
+    win->settingUrl = true; SetWindowTextW(win->editUrl, url.c_str()); win->settingUrl = false;
 }
 static void UpdateReloadButton(BrowserWindow* win)
 {
     if (!win->btnReload) return;
-    SetWindowTextW(win->btnReload, win->isLoading ? L"⏹" : L"↺");
+    bool loading = win->active >= 0 && win->active < (int)win->tabs.size() && win->tabs[win->active].loading;
+    SetWindowTextW(win->btnReload, loading ? L"⏹" : L"↺");
 }
 
 // Give the frame its own taskbar button / Alt+Tab slot. Winamp creates the
@@ -237,6 +267,41 @@ static void EnableTaskbarButton(HWND frame)
     ex |= WS_EX_APPWINDOW;
     ex &= ~WS_EX_TOOLWINDOW;
     SetWindowLongPtr(frame, GWL_EXSTYLE, ex);
+}
+
+// Windows keeps an owner and everything it owns together in the z-order, so while
+// Winamp's main window owned the frame, bringing the browser forward dragged the
+// library, playlist and the rest up with it. Without an owner it is raised, and
+// Alt+Tabbed to, on its own.
+static void DetachFromWinampWindows(HWND frame)
+{
+    if (!frame || (GetWindowLongPtr(frame, GWL_STYLE) & WS_CHILD)) return; // docked into a skin
+    if (GetWindow(frame, GW_OWNER)) SetWindowLongPtr(frame, GWLP_HWNDPARENT, 0);
+}
+
+// Windows only maximizes (Win+Up), minimizes (Win+Down) and snaps (Win+Left/Right)
+// windows that say they can be, which Winamp's frames don't. Those styles normally bring
+// a system border with them. FrameProc hands all of it back to the client area and DWM is
+// told to draw none of it, so the frame still looks exactly the way Winamp paints it.
+static void EnableSnapAndMaximize(HWND frame)
+{
+    if (!frame) return;
+    SetWindowLongPtr(frame, GWL_STYLE, GetWindowLongPtr(frame, GWL_STYLE) | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX);
+    DWMNCRENDERINGPOLICY policy = DWMNCRP_DISABLED;
+    DwmSetWindowAttribute(frame, DWMWA_NCRENDERING_POLICY, &policy, sizeof(policy));
+    SetWindowPos(frame, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+// Turns a maximized frame back into a normal window at rc (screen coordinates).
+static void RestoreFrameTo(HWND frame, const RECT& rc)
+{
+    WINDOWPLACEMENT wp{ sizeof(wp) };
+    if (!GetWindowPlacement(frame, &wp)) return;
+    wp.rcNormalPosition = rc;
+    wp.showCmd = SW_SHOWNORMAL;
+    SetWindowPlacement(frame, &wp);
+    // A placement is measured from the work area's corner; this settles any difference.
+    SetWindowPos(frame, nullptr, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 // Reflect the active tab's title in the frame caption so each window is a
@@ -263,11 +328,24 @@ static void ReopenLastClosedTab(BrowserWindow* win)
 static bool HandleGlobalShortcut(BrowserWindow* win, WPARAM w, bool ctrl, bool shift, bool alt) {
     // Handles shortcuts locally when the plugin or webview is focused.
 
-    if (ctrl && !shift && !alt && w == 'N') { CreateBrowserWindow(true); return true; }
+    if (g_drag.tabId && w == VK_ESCAPE) { EndTabDrag(); return true; }
 
-    if (ctrl && shift && !alt && w == 'T') { ReopenLastClosedTab(win); return true; }
+    if (ctrl && !shift && !alt && w == 'N') {
+        // Opens at the size of the window it came from, stepped down and right of it.
+        RECT r; bool like = win && GetWindowRect(win->embedFrame, &r);
+        if (like) OffsetRect(&r, 30, 30);
+        BrowserWindow* nw = CreateBrowserWindow(true, like ? &r : nullptr);
+        if (nw) SetForegroundWindow(nw->embedFrame);
+        return true;
+    }
 
     if (!win) return false;
+
+    // These need the tab strip and toolbar back, so they end fullscreen video first.
+    if (win->isFullscreen && ctrl && !alt && (w == 'L' || w == 'T' || w == 'W' || w == VK_TAB))
+        LeaveVideoFullscreen(win);
+
+    if (ctrl && shift && !alt && w == 'T') { ReopenLastClosedTab(win); return true; }
 
     if (ctrl && !shift && !alt && w == 'L') { FocusAddressBar(win); win->editDirty = true; return true; }
     if (ctrl && !alt && !shift && w == 'T') { NewTab(win); return true; }
@@ -364,11 +442,18 @@ static void EnsureGlobals()
     // The WebView2 controller is reparented into this instead of resizing the
     // Winamp-owned embed frame, which avoids fighting Winamp's own window chrome.
     WNDCLASSW wcfs = {};
-    wcfs.lpfnWndProc = DefWindowProcW;
+    wcfs.lpfnWndProc = FullscreenProc;
     wcfs.hInstance = g_hInst;
     wcfs.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     wcfs.lpszClassName = L"ExodiumFullscreen";
     RegisterClassW(&wcfs);
+
+    // Floating copy of a tab that follows the cursor while the tab is dragged.
+    WNDCLASSW wcgh = {};
+    wcgh.lpfnWndProc = TabGhostProc;
+    wcgh.hInstance = g_hInst;
+    wcgh.lpszClassName = L"ExodiumTabGhost";
+    RegisterClassW(&wcgh);
 
     LoadHistory();
 
@@ -469,6 +554,18 @@ static void CommitSuggestion(BrowserWindow* win, bool navigate) {
     HideSuggestions(win); SetFocus(win->editUrl); SendMessageW(win->editUrl, EM_SETSEL, 0, -1);
     if (navigate) { win->editDirty = false; NavigateFromUrlBox(win); }
 }
+// Closes the list and hands the keyboard back to the address bar with the picked
+// suggestion left in it, caret at the end, ready to be edited or added to.
+static void EditPickedSuggestion(BrowserWindow* win) {
+    HideSuggestions(win);
+    if (!win->editUrl) return;
+    SetFocus(win->editUrl);
+    int len = GetWindowTextLengthW(win->editUrl);
+    SendMessageW(win->editUrl, EM_SETSEL, len, len);
+    SendMessageW(win->editUrl, EM_SCROLLCARET, 0, 0);
+    win->editDirty = true; // it is the user's text now; page events must not replace it
+}
+
 static LRESULT CALLBACK SuggestSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR)
 {
     BrowserWindow* win = WinFromChild(h);
@@ -479,20 +576,22 @@ static LRESULT CALLBACK SuggestSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
 
     case WM_CHAR:
     {
-        if (GetKeyState(VK_CONTROL) & 0x8000)
-            return 0;
-
         wchar_t ch = static_cast<wchar_t>(w);
 
         if (ch == L'\r') {
             if (win) CommitSuggestion(win, true);
             return 0;
         }
-        if (ch == L'\x1b') {
-            if (win) { HideSuggestions(win); if (win->editUrl) SetFocus(win->editUrl); }
+        // Escape was handled on WM_KEYDOWN; the rest are leftovers of Ctrl shortcuts.
+        if (ch < 0x20 && ch != L'\b')
             return 0;
+
+        // Typing, or Backspace, carries on from the picked suggestion in the address bar.
+        if (win && win->editUrl) {
+            EditPickedSuggestion(win);
+            SendMessageW(win->editUrl, WM_CHAR, w, l);
         }
-        break;
+        return 0;
     }
 
     case WM_KEYDOWN:
@@ -507,7 +606,7 @@ static LRESULT CALLBACK SuggestSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
             return 0;
         }
         if (w == VK_ESCAPE) {
-            if (win) { HideSuggestions(win); if (win->editUrl) SetFocus(win->editUrl); }
+            if (win) EditPickedSuggestion(win);
             return 0;
         }
         if (w == VK_UP) {
@@ -601,6 +700,7 @@ static LRESULT CALLBACK EditSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR
         bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
         if (HandleGlobalShortcut(win, (WPARAM)w, ctrl, shift, alt)) return 0;
         if (win && ctrl && w == 'L') { FocusAddressBar(win); win->editDirty = true; return 0; }
+        if (win && h == win->editUrl && ctrl && !alt && w == 'A') { SendMessageW(h, EM_SETSEL, 0, -1); return 0; }
         if (win && w == VK_DOWN && win->suggestVisible) {
             SetFocus(win->suggest);
             SendMessageW(win->suggest, LB_SETCURSEL, 0, 0);
@@ -613,16 +713,30 @@ static LRESULT CALLBACK EditSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR
     }
 
     case WM_CHAR:
-    {
-        if (GetKeyState(VK_CONTROL) & 0x8000)
+        // Enter already navigated on WM_KEYDOWN. The other control characters are what
+        // shortcuts like Ctrl+L or Ctrl+T leave behind, and the edit would beep at them
+        // or insert junk. Only copy, paste, cut, undo and Backspace go through. Testing
+        // the character rather than the Ctrl key keeps AltGr-typed characters working.
+        if ((w < 0x20 || w == 0x7F) && w != 0x03 && w != 0x16 && w != 0x18 && w != 0x1A && w != L'\b')
             return 0;
+        break;
 
-        if (w == L'\r') {
-            if (win) { win->editDirty = false; NavigateFromUrlBox(win); }
-            return 0;
+    case WM_LBUTTONDOWN:
+        if (win && h == win->editUrl && GetFocus() != h) win->urlClickSelect = true;
+        break;
+
+    case WM_LBUTTONUP:
+        // Clicking into the address bar selects the whole URL, as browsers do, unless
+        // that click was itself a drag-select.
+        if (win && h == win->editUrl && win->urlClickSelect) {
+            win->urlClickSelect = false;
+            LRESULT r = DefSubclassProc(h, m, w, l);
+            DWORD from = 0, to = 0;
+            SendMessageW(h, EM_GETSEL, (WPARAM)&from, (LPARAM)&to);
+            if (from == to) SendMessageW(h, EM_SETSEL, 0, -1);
+            return r;
         }
         break;
-    }
     }
 
     return DefSubclassProc(h, m, w, l);
@@ -647,13 +761,17 @@ static void LayoutToolbarAndTabs(BrowserWindow* win) {
     if (!win->tabBar) win->tabBar = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, win->client, (HMENU)IDC_TABBAR, g_hInst, nullptr);
     MoveWindow(win->tabBar, 0, 0, rc.right, kTabBarH, TRUE);
 
-    int x = kMargin; const int tabH = kTabBarH - 2, tabW = 140;
+    // Tabs are full width while they all fit and squeeze evenly once they don't.
+    const int tabH = kTabBarH - 2, tabCount = (int)win->tabs.size();
+    int x = kMargin, tabW = kTabW;
+    if (tabCount > 0) tabW = max(kTabMinW, min(kTabW, (rc.right - 26 - kMargin) / tabCount - 4));
     for (int i = 0; i < (int)win->tabs.size(); ++i) {
         if (!win->tabs[i].btn) {
             win->tabs[i].btn = CreateWindowExW(0, L"BUTTON", win->tabs[i].title.empty() ? L"(new tab)" : win->tabs[i].title.c_str(),
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, win->client, (HMENU)(INT_PTR)(WM_APP_SWITCH_TAB + i), g_hInst, nullptr);
             SendMessageW(win->tabs[i].btn, WM_SETFONT, (WPARAM)(g_font ? g_font : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
             SubclassCtrlCommon(win->tabs[i].btn);
+            SetWindowSubclass(win->tabs[i].btn, TabButtonSubproc, 3, 0);
         }
         else {
             SetWindowLongPtrW(win->tabs[i].btn, GWLP_ID, (LONG_PTR)(WM_APP_SWITCH_TAB + i));
@@ -695,13 +813,15 @@ static void LayoutToolbarAndTabs(BrowserWindow* win) {
     SubclassCtrlCommon(win->btnCloseTab);
     SetWindowSubclass(win->editUrl, EditSubproc, 1, 0);
 
-    MoveWindow(win->btnBack, tX, y, kBtnW, h, TRUE); tX += kBtnW + kBtnGap;
-    MoveWindow(win->btnFwd, tX, y, kBtnW, h, TRUE); tX += kBtnW + kBtnGap;
-    MoveWindow(win->btnReload, tX, y, kBtnW, h, TRUE); tX += kBtnW + kBtnGap;
-    MoveWindow(win->btnCloseTab, tX, y, kBtnW, h, TRUE); tX += kBtnW + kBtnGap;
+    // In a narrow window the buttons give up width before the address bar does.
+    const int btnW = max(28, min(kBtnW, (rc.right - 2 * kMargin - 160) / 4 - kBtnGap));
+    MoveWindow(win->btnBack, tX, y, btnW, h, TRUE); tX += btnW + kBtnGap;
+    MoveWindow(win->btnFwd, tX, y, btnW, h, TRUE); tX += btnW + kBtnGap;
+    MoveWindow(win->btnReload, tX, y, btnW, h, TRUE); tX += btnW + kBtnGap;
+    MoveWindow(win->btnCloseTab, tX, y, btnW, h, TRUE); tX += btnW + kBtnGap;
 
     int urlW = rc.right - tX - kMargin;
-    if (urlW < 120) urlW = 120;
+    if (urlW < 40) urlW = 40;
     MoveWindow(win->editUrl, tX, y, urlW, h, TRUE);
     EnsureSuggestListbox(win); HideSuggestions(win);
 
@@ -724,6 +844,7 @@ static void SwitchToTab(BrowserWindow* win, int idx) {
     win->active = idx;
     LayoutActiveWebView(win);
     UpdateUrlBox(win);
+    UpdateReloadButton(win);
     UpdateFrameTitle(win);
     HideSuggestions(win);
 
@@ -732,6 +853,10 @@ static void SwitchToTab(BrowserWindow* win, int idx) {
 
     if (win->tabs[win->active].ctl) {
         win->tabs[win->active].ctl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+    }
+    else {
+        // Webviews are only made for tabs that get looked at; this one's turn has come.
+        PostMessage(win->client, WM_APP_INIT_WEBVIEW, 0, 0);
     }
 }
 static void NextTab(BrowserWindow* win) {
@@ -748,15 +873,38 @@ static void NewTab(BrowserWindow* win, const wchar_t* url /*= L"https://google.c
     if (!url) url = L"https://google.com/";
     int idx = (int)win->tabs.size();
     win->tabs.push_back(Tab{});
-    win->tabs[idx].id = win->nextTabId++;
+    win->tabs[idx].id = g_nextTabId++;
     win->tabs[idx].title = L"(new tab)";
     win->tabs[idx].pendingUri = url ? url : L"";
     LayoutToolbarAndTabs(win);
     SwitchToTab(win, idx);
     PostMessage(win->client, WM_APP_INIT_WEBVIEW, 0, 0);
 }
+// Re-syncs a window after the tab at idx was taken out of it. It must still have tabs.
+static void RefreshAfterTabRemoved(BrowserWindow* win, int idx) {
+    if (win->active >= idx) win->active = max(0, win->active - 1);
+
+    LayoutToolbarAndTabs(win);
+    // Force a full refresh of the active tab's visuals since indices shifted.
+    int cur = win->active; win->active = -1; SwitchToTab(win, cur);
+}
+// A window left without tabs goes away, the same way it does when its close button
+// is clicked. It keeps a blank tab for when it is shown again.
+static void CloseEmptiedWindow(BrowserWindow* win) {
+    win->tabs.push_back(Tab{});
+    win->tabs[0].id = g_nextTabId++;
+    win->active = 0;
+    win->editDirty = false; // whatever was being typed belonged to the tab that is gone
+    HideSuggestions(win);
+    LayoutToolbarAndTabs(win);
+    UpdateFrameTitle(win);
+    UpdateUrlBox(win);
+    UpdateReloadButton(win);
+    SendMessage(win->client, WM_CLOSE, 0, 0);
+}
 static void CloseTab(BrowserWindow* win, int idx) {
     if (idx < 0 || idx >= (int)win->tabs.size()) return;
+    if (win->isFullscreen && win->tabs[idx].id == win->fsTabId) LeaveVideoFullscreen(win);
 
     std::wstring closingUrl;
     if (!win->tabs[idx].lastUri.empty()) {
@@ -780,19 +928,250 @@ static void CloseTab(BrowserWindow* win, int idx) {
     win->tabs.erase(win->tabs.begin() + idx);
 
     if (win->tabs.empty()) {
-        win->active = -1;
-        NewTab(win, L"https://google.com/");
+        CloseEmptiedWindow(win);
         return;
     }
-    else if (win->active >= idx) {
-        win->active = max(0, win->active - 1);
-    }
-
-    LayoutToolbarAndTabs(win);
-    // Force a full refresh of the active tab's visuals since indices shifted.
-    int cur = win->active; win->active = -1; SwitchToTab(win, cur);
+    RefreshAfterTabRemoved(win, idx);
 }
 static void CloseActiveTab(BrowserWindow* win) { CloseTab(win, win->active); }
+
+// ---------- tab dragging ----------
+// A tab can be dragged along its strip to reorder it, onto another window's strip
+// to move it there, or away from every strip to give it a window of its own.
+
+// Moves a tab, live webview included, to position insertAt of dst, counted without
+// the moved tab. dst may be the window the tab is already in.
+static void MoveTab(BrowserWindow* src, int idx, BrowserWindow* dst, int insertAt)
+{
+    if (idx < 0 || idx >= (int)src->tabs.size()) return;
+    int others = (int)dst->tabs.size() - (dst == src ? 1 : 0);
+    insertAt = max(0, min(insertAt, others));
+
+    if (dst == src) {
+        if (insertAt == idx) return;
+        int activeId = src->active >= 0 ? src->tabs[src->active].id : 0;
+        Tab tab = std::move(src->tabs[idx]);
+        src->tabs.erase(src->tabs.begin() + idx);
+        src->tabs.insert(src->tabs.begin() + insertAt, std::move(tab));
+        src->active = TabIndexById(src, activeId);
+        LayoutToolbarAndTabs(src); // renumbers and repositions the tab buttons
+        for (auto& t : src->tabs) if (t.btn) InvalidateRect(t.btn, nullptr, TRUE);
+        return;
+    }
+
+    Tab tab = std::move(src->tabs[idx]);
+    src->tabs.erase(src->tabs.begin() + idx);
+
+    // Tab buttons are children of their window's client, so dst makes a fresh one
+    // on layout. The webview itself just moves to the new parent.
+    if (tab.btn) { DestroyWindow(tab.btn); tab.btn = nullptr; }
+    if (tab.ctl) {
+        tab.ctl->put_IsVisible(FALSE);
+        tab.ctl->put_ParentWindow(dst->client);
+    }
+
+    if (src->tabs.empty()) {
+        CloseEmptiedWindow(src);
+    }
+    else {
+        RefreshAfterTabRemoved(src, idx);
+    }
+
+    dst->tabs.insert(dst->tabs.begin() + insertAt, std::move(tab));
+    dst->active = -1; // indices shifted; SwitchToTab below re-syncs everything
+    LayoutToolbarAndTabs(dst);
+    SwitchToTab(dst, insertAt);
+    if (dst->tabs[insertAt].ctl) dst->tabs[insertAt].ctl->NotifyParentWindowPositionChanged();
+}
+
+// Finds the tab strip under a screen point. insertAt is the position the dragged
+// tab would take among that window's other tabs, marker where to draw the mark.
+static BrowserWindow* TabDropTarget(POINT pt, int dragTabId, int& insertAt, POINT& marker)
+{
+    BrowserWindow* dst = nullptr;
+    HWND desktop = GetDesktopWindow();
+    for (HWND h = WindowFromPoint(pt); h && h != desktop && !dst; h = GetAncestor(h, GA_PARENT))
+        for (auto& w : g_windows) if (h == w->client || h == w->embedFrame) { dst = w.get(); break; }
+    if (!dst || dst->isFullscreen || !dst->tabBar) return nullptr;
+
+    RECT strip; GetWindowRect(dst->tabBar, &strip);
+    RECT hit = strip; InflateRect(&hit, 0, kTabDetachSlop);
+    if (!PtInRect(&hit, pt)) return nullptr;
+
+    // The mark sits in the gap in front of the first tab whose middle is right of the cursor.
+    insertAt = 0;
+    marker = { strip.left + kMargin - 3, strip.top + 1 };
+    for (auto& t : dst->tabs) {
+        if (t.id == dragTabId || !t.btn) continue;
+        RECT br; GetWindowRect(t.btn, &br);
+        if (pt.x < (br.left + br.right) / 2) { marker.x = br.left - 3; break; }
+        ++insertAt;
+        marker.x = br.right + 1;
+    }
+    return dst;
+}
+
+// Moves a window so that its first tab's top-left corner lands on a screen point.
+static void MoveFrameTabTo(BrowserWindow* win, POINT at)
+{
+    if (win->tabs.empty() || !win->tabs[0].btn) return;
+    RECT fr, br; GetWindowRect(win->embedFrame, &fr); GetWindowRect(win->tabs[0].btn, &br);
+    int x = fr.left + at.x - br.left, y = fr.top + at.y - br.top;
+    MONITORINFO mi = { sizeof(MONITORINFO) };
+    if (GetMonitorInfo(MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST), &mi)) y = max(y, (int)mi.rcWork.top);
+    SetWindowPos(win->embedFrame, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void DropDraggedTab(const TabDrop& drop)
+{
+    BrowserWindow* src = WinFromTabId(drop.tabId);
+    if (!src || src->isFullscreen) return;
+    POINT tabAt = { drop.pt.x - drop.grab.x, drop.pt.y - drop.grab.y };
+
+    int insertAt = 0; POINT marker = {};
+    BrowserWindow* dst = TabDropTarget(drop.pt, drop.tabId, insertAt, marker);
+    bool newWindow = false;
+    if (!dst) {
+        // Dropped away from every tab strip: the tab gets a window of its own, the
+        // size of the one it came from. A window's only tab just takes its window along.
+        if (src->tabs.size() == 1) { MoveFrameTabTo(src, tabAt); return; }
+        RECT sr; GetWindowRect(src->embedFrame, &sr);
+        dst = CreateBrowserWindow(true, &sr, true);
+        if (!dst) return;
+        newWindow = true;
+    }
+
+    MoveTab(src, TabIndexById(src, drop.tabId), dst, insertAt);
+
+    if (newWindow) {
+        MoveFrameTabTo(dst, tabAt);
+        ShowWindow(dst->embedFrame, SW_SHOWNA);
+    }
+    SetForegroundWindow(dst->embedFrame);
+    if (dst->active >= 0 && dst->tabs[dst->active].ctl)
+        dst->tabs[dst->active].ctl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+}
+
+static LRESULT CALLBACK TabGhostProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (msg == WM_PAINT) {
+        // Drawn exactly like the active tab; the ghost's window text is the tab title.
+        PAINTSTRUCT ps;
+        DRAWITEMSTRUCT dis = {};
+        dis.hwndItem = hwnd;
+        dis.hDC = BeginPaint(hwnd, &ps);
+        GetClientRect(hwnd, &dis.rcItem);
+        HICON icon = nullptr;
+        if (BrowserWindow* win = WinFromTabId(g_drag.tabId)) icon = win->tabs[TabIndexById(win, g_drag.tabId)].favicon;
+        DrawOwnerButton(&dis, true, true, icon);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void BeginTabDrag()
+{
+    g_drag.dragging = true;
+
+    // Layered + transparent keeps both windows click-through, so they never get in
+    // the way of finding the window under the cursor.
+    const DWORD ex = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
+    RECT br; GetWindowRect(g_drag.btn, &br);
+    wchar_t title[256] = L""; GetWindowTextW(g_drag.btn, title, ARRAYSIZE(title));
+    g_drag.ghost = CreateWindowExW(ex, L"ExodiumTabGhost", title, WS_POPUP,
+        br.left, br.top, br.right - br.left, br.bottom - br.top, nullptr, nullptr, g_hInst, nullptr);
+    if (g_drag.ghost) SetLayeredWindowAttributes(g_drag.ghost, 0, 200, LWA_ALPHA);
+    g_drag.marker = CreateWindowExW(ex, L"STATIC", L"", WS_POPUP | SS_WHITERECT,
+        0, 0, 2, kTabBarH - 2, nullptr, nullptr, g_hInst, nullptr);
+    if (g_drag.marker) SetLayeredWindowAttributes(g_drag.marker, 0, 255, LWA_ALPHA);
+}
+
+static void UpdateTabDrag(POINT pt)
+{
+    if (g_drag.ghost)
+        SetWindowPos(g_drag.ghost, HWND_TOPMOST, pt.x - g_drag.grab.x, pt.y - g_drag.grab.y, 0, 0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (!g_drag.marker) return;
+    int insertAt = 0; POINT marker = {};
+    if (TabDropTarget(pt, g_drag.tabId, insertAt, marker))
+        SetWindowPos(g_drag.marker, HWND_TOPMOST, marker.x, marker.y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    else
+        ShowWindow(g_drag.marker, SW_HIDE);
+}
+
+// Ends the press/drag without dropping anything; also used to cancel one.
+static void EndTabDrag()
+{
+    TabDrag d = g_drag;
+    g_drag = {}; // cleared first: releasing capture re-enters via WM_CAPTURECHANGED
+    if (d.ghost) DestroyWindow(d.ghost);
+    if (d.marker) DestroyWindow(d.marker);
+    if (d.btn && GetCapture() == d.btn) ReleaseCapture();
+}
+
+static LRESULT CALLBACK TabButtonSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR)
+{
+    switch (m) {
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK: {
+        // Handled here rather than by the button so that a press can turn into a
+        // drag. As in Chrome, the tab is selected on press, not on release.
+        BrowserWindow* win = WinFromChild(h);
+        int idx = GetDlgCtrlID(h) - (int)WM_APP_SWITCH_TAB;
+        if (!win || idx < 0 || idx >= (int)win->tabs.size()) break;
+        EndTabDrag();
+        SetFocus(h);
+        SwitchToTab(win, idx);
+        g_drag.tabId = win->tabs[idx].id;
+        g_drag.btn = h;
+        g_drag.grab = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        SetCapture(h);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (g_drag.btn != h) break;
+        POINT pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        if (!g_drag.dragging) {
+            if (abs(pt.x - g_drag.grab.x) <= GetSystemMetrics(SM_CXDRAG) &&
+                abs(pt.y - g_drag.grab.y) <= GetSystemMetrics(SM_CYDRAG))
+                return 0;
+            BeginTabDrag();
+        }
+        ClientToScreen(h, &pt);
+        UpdateTabDrag(pt);
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        if (g_drag.btn != h) break;
+        TabDrop* drop = nullptr;
+        if (g_drag.dragging) {
+            drop = new TabDrop{ g_drag.tabId, { GET_X_LPARAM(l), GET_Y_LPARAM(l) }, g_drag.grab };
+            ClientToScreen(h, &drop->pt);
+        }
+        EndTabDrag();
+        // Posted, so that the drop never destroys this button from inside its own message.
+        if (drop && !PostMessage(GetParent(h), WM_APP_DROP_TAB, 0, (LPARAM)drop)) delete drop;
+        return 0;
+    }
+    case WM_MBUTTONUP: {
+        // Middle-click closes the tab. Posted, for the same reason as a drop.
+        BrowserWindow* win = WinFromChild(h);
+        int idx = GetDlgCtrlID(h) - (int)WM_APP_SWITCH_TAB;
+        if (win && idx >= 0 && idx < (int)win->tabs.size())
+            PostMessage(win->client, WM_APP_CLOSE_TAB, (WPARAM)win->tabs[idx].id, 0);
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        if (g_drag.btn == h) EndTabDrag();
+        break;
+    case WM_NCDESTROY:
+        if (g_drag.btn == h) EndTabDrag();
+        RemoveWindowSubclass(h, TabButtonSubproc, id);
+        break;
+    }
+    return DefSubclassProc(h, m, w, l);
+}
 
 // ---------- webview wiring ----------
 static void SetToolbarControlsVisible(BrowserWindow* win, bool visible) {
@@ -866,16 +1245,36 @@ static void ExitVideoFullscreen(BrowserWindow* win) {
     LayoutToolbarAndTabs(win); // recomputes normal bounds via LayoutActiveWebView
 }
 
-static void WireTabEvents(BrowserWindow* win, int tabId) {
-    int idx = TabIndexById(win, tabId);
+// Ends fullscreen from our side (a shortcut, a closing tab) rather than the page's.
+// The page is told as well, so it doesn't keep its fullscreen layout inside the tab.
+static void LeaveVideoFullscreen(BrowserWindow* win) {
+    if (!win->isFullscreen) return;
+    int i = TabIndexById(win, win->fsTabId);
+    if (i >= 0 && win->tabs[i].web) win->tabs[i].web->ExecuteScript(L"document.exitFullscreen()", nullptr);
+    ExitVideoFullscreen(win);
+}
+
+static LRESULT CALLBACK FullscreenProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // Alt+F4 must not destroy this window with a tab's webview still inside it.
+    if (msg == WM_CLOSE) {
+        for (auto& w : g_windows) if (w->fsWnd == hwnd) { LeaveVideoFullscreen(w.get()); break; }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// Handlers look the tab's window up by id on every event instead of capturing it,
+// so they keep working after the tab is dragged to another window.
+static void WireTabEvents(BrowserWindow* owner, int tabId) {
+    int idx = TabIndexById(owner, tabId);
     if (idx < 0) return;
 
-    ComPtr<ICoreWebView2> web = win->tabs[idx].web;
-    if (!web || !win->tabs[idx].ctl) return;
+    ComPtr<ICoreWebView2> web = owner->tabs[idx].web;
+    if (!web || !owner->tabs[idx].ctl) return;
 
     web->add_DocumentTitleChanged(Microsoft::WRL::Callback<ICoreWebView2DocumentTitleChangedEventHandler>(
-        [win, tabId](ICoreWebView2* s, IUnknown*)->HRESULT {
-            if (!WinAlive(win)) return S_OK;
+        [tabId](ICoreWebView2* s, IUnknown*)->HRESULT {
+            BrowserWindow* win = WinFromTabId(tabId); if (!win) return S_OK;
             int i = TabIndexById(win, tabId); if (i < 0) return S_OK;
             LPWSTR t = nullptr;
             if (s && SUCCEEDED(s->get_DocumentTitle(&t))) {
@@ -886,14 +1285,13 @@ static void WireTabEvents(BrowserWindow* win, int tabId) {
         }).Get(), nullptr);
 
     web->add_NavigationStarting(Microsoft::WRL::Callback<ICoreWebView2NavigationStartingEventHandler>(
-        [win, tabId](ICoreWebView2* s, ICoreWebView2NavigationStartingEventArgs* a)->HRESULT {
-            if (!s || !a || !WinAlive(win)) return S_OK;
+        [tabId](ICoreWebView2* s, ICoreWebView2NavigationStartingEventArgs* a)->HRESULT {
+            BrowserWindow* win = WinFromTabId(tabId);
+            if (!s || !a || !win) return S_OK;
             int i = TabIndexById(win, tabId); if (i < 0) return S_OK;
 
-            if (i == win->active) {
-                win->isLoading = true;
-                UpdateReloadButton(win);
-            }
+            win->tabs[i].loading = true;
+            if (i == win->active) UpdateReloadButton(win);
 
             LPWSTR uri = nullptr;
             if (SUCCEEDED(a->get_Uri(&uri))) {
@@ -908,8 +1306,9 @@ static void WireTabEvents(BrowserWindow* win, int tabId) {
         }).Get(), nullptr);
 
     web->add_SourceChanged(Microsoft::WRL::Callback<ICoreWebView2SourceChangedEventHandler>(
-        [win, tabId](ICoreWebView2* s, ICoreWebView2SourceChangedEventArgs*)->HRESULT {
-            if (!s || !WinAlive(win)) return S_OK;
+        [tabId](ICoreWebView2* s, ICoreWebView2SourceChangedEventArgs*)->HRESULT {
+            BrowserWindow* win = WinFromTabId(tabId);
+            if (!s || !win) return S_OK;
             int i = TabIndexById(win, tabId); if (i < 0 || i != win->active) return S_OK;
             if (GetFocus() == win->editUrl && win->editDirty) return S_OK;
 
@@ -924,8 +1323,8 @@ static void WireTabEvents(BrowserWindow* win, int tabId) {
         }).Get(), nullptr);
 
     web->add_NavigationCompleted(Microsoft::WRL::Callback<ICoreWebView2NavigationCompletedEventHandler>(
-        [win, tabId](ICoreWebView2* s, ICoreWebView2NavigationCompletedEventArgs*)->HRESULT {
-            if (!WinAlive(win)) return S_OK;
+        [tabId](ICoreWebView2* s, ICoreWebView2NavigationCompletedEventArgs*)->HRESULT {
+            BrowserWindow* win = WinFromTabId(tabId); if (!win) return S_OK;
             int i = TabIndexById(win, tabId); if (i < 0) return S_OK;
             if (s) {
                 LPWSTR src = nullptr;
@@ -942,21 +1341,20 @@ static void WireTabEvents(BrowserWindow* win, int tabId) {
                 }
             }
 
-            if (i == win->active) {
-                win->isLoading = false;
-                UpdateReloadButton(win);
-            }
+            win->tabs[i].loading = false;
+            if (i == win->active) UpdateReloadButton(win);
             return S_OK;
         }).Get(), nullptr);
 
     web->add_NewWindowRequested(Microsoft::WRL::Callback<ICoreWebView2NewWindowRequestedEventHandler>(
-        [win](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* a)->HRESULT {
+        [tabId](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* a)->HRESULT {
             // Popup-based OAuth (Google Identity Services, etc.) hands the caller's
             // script a reference via window.open() and talks to it over
             // window.opener/postMessage. That only works if we give WebView2 a real
             // CoreWebView2 via put_NewWindow — a plain new tab leaves window.open()
             // returning null and breaks those sign-in flows.
-            if (!WinAlive(win) || !g_env) {
+            BrowserWindow* win = WinFromTabId(tabId);
+            if (!win || !g_env) {
                 a->put_Handled(TRUE);
                 return S_OK;
             }
@@ -967,27 +1365,39 @@ static void WireTabEvents(BrowserWindow* win, int tabId) {
 
             int idx = (int)win->tabs.size();
             win->tabs.push_back(Tab{});
-            int tabId = win->nextTabId++;
-            win->tabs[idx].id = tabId;
+            int newId = g_nextTabId++;
+            win->tabs[idx].id = newId;
             win->tabs[idx].title = L"(new tab)";
+            win->tabs[idx].creating = true;
             LayoutToolbarAndTabs(win);
-            SwitchToTab(win, idx);
 
-            g_env->CreateCoreWebView2Controller(win->client,
+            // Ctrl+click opens the link in the background, as browsers do; adding Shift
+            // goes to it. The event doesn't say how the link was clicked, but it arrives
+            // while the keys are still down.
+            BOOL byUser = FALSE; args->get_IsUserInitiated(&byUser);
+            bool inBackground = byUser && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && !(GetAsyncKeyState(VK_SHIFT) & 0x8000);
+            if (!inBackground) SwitchToTab(win, idx);
+
+            HWND parent = win->client;
+            g_env->CreateCoreWebView2Controller(parent,
                 Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                    [win, tabId, args, deferral](HRESULT hr2, ICoreWebView2Controller* ctl)->HRESULT {
-                        if (SUCCEEDED(hr2) && ctl && WinAlive(win)) {
-                            int i = TabIndexById(win, tabId);
+                    [newId, parent, args, deferral](HRESULT hr2, ICoreWebView2Controller* ctl)->HRESULT {
+                        BrowserWindow* win = WinFromTabId(newId);
+                        if (win) win->tabs[TabIndexById(win, newId)].creating = false;
+                        if (SUCCEEDED(hr2) && ctl && win) {
+                            int i = TabIndexById(win, newId);
                             if (i >= 0) {
                                 win->tabs[i].ctl = ctl;
                                 ctl->get_CoreWebView2(&win->tabs[i].web);
+                                // The tab may have been dragged to another window meanwhile.
+                                if (win->client != parent) ctl->put_ParentWindow(win->client);
 
                                 RECT rc; GetClientRect(win->client, &rc);
                                 RECT b = { kMargin, kTabBarH + kToolbarH, rc.right - kMargin, rc.bottom - kMargin };
                                 ctl->put_Bounds(b);
                                 ctl->put_IsVisible(FALSE);
 
-                                WireTabEvents(win, tabId);
+                                WireTabEvents(win, newId);
 
                                 // Must not be navigated before this call — WebView2
                                 // auto-navigates it to the requested uri once assigned.
@@ -1020,8 +1430,8 @@ static void WireTabEvents(BrowserWindow* win, int tabId) {
             }).Get(), nullptr);
     }
 
-    win->tabs[idx].ctl->add_AcceleratorKeyPressed(Microsoft::WRL::Callback<ICoreWebView2AcceleratorKeyPressedEventHandler>(
-        [win](ICoreWebView2Controller*, ICoreWebView2AcceleratorKeyPressedEventArgs* args)->HRESULT {
+    owner->tabs[idx].ctl->add_AcceleratorKeyPressed(Microsoft::WRL::Callback<ICoreWebView2AcceleratorKeyPressedEventHandler>(
+        [tabId](ICoreWebView2Controller*, ICoreWebView2AcceleratorKeyPressedEventArgs* args)->HRESULT {
             UINT vk = 0; args->get_VirtualKey(&vk);
             COREWEBVIEW2_KEY_EVENT_KIND kind; args->get_KeyEventKind(&kind);
             if (kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN &&
@@ -1031,7 +1441,8 @@ static void WireTabEvents(BrowserWindow* win, int tabId) {
             bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
-            if (WinAlive(win) && HandleGlobalShortcut(win, vk, ctrl, shift, alt)) {
+            BrowserWindow* win = WinFromTabId(tabId);
+            if (win && HandleGlobalShortcut(win, vk, ctrl, shift, alt)) {
                 args->put_Handled(TRUE);
                 return S_OK;
             }
@@ -1043,8 +1454,8 @@ static void WireTabEvents(BrowserWindow* win, int tabId) {
     if (SUCCEEDED(web.As(&web15))) {
         web15->add_FaviconChanged(
             Microsoft::WRL::Callback<ICoreWebView2FaviconChangedEventHandler>(
-                [win, tabId](ICoreWebView2* sender, IUnknown*) -> HRESULT {
-                    if (!sender || !WinAlive(win)) return S_OK;
+                [tabId](ICoreWebView2* sender, IUnknown*) -> HRESULT {
+                    if (!sender) return S_OK;
 
                     Microsoft::WRL::ComPtr<ICoreWebView2_15> wv15;
                     if (FAILED(sender->QueryInterface(IID_PPV_ARGS(&wv15)))) return S_OK;
@@ -1052,7 +1463,7 @@ static void WireTabEvents(BrowserWindow* win, int tabId) {
                     return wv15->GetFavicon(
                         COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG,
                         Microsoft::WRL::Callback<ICoreWebView2GetFaviconCompletedHandler>(
-                            [win, tabId](HRESULT hr, IStream* iconStream) -> HRESULT {
+                            [tabId](HRESULT hr, IStream* iconStream) -> HRESULT {
                                 if (FAILED(hr)) return S_OK;
 
                                 HICON newIcon = nullptr;
@@ -1067,7 +1478,8 @@ static void WireTabEvents(BrowserWindow* win, int tabId) {
                                     }
                                 }
 
-                                int i = WinAlive(win) ? TabIndexById(win, tabId) : -1;
+                                BrowserWindow* win = WinFromTabId(tabId);
+                                int i = win ? TabIndexById(win, tabId) : -1;
                                 if (i >= 0) {
                                     Tab& t = win->tabs[i];
                                     if (t.favicon) { DestroyIcon(t.favicon); t.favicon = nullptr; }
@@ -1086,8 +1498,9 @@ static void WireTabEvents(BrowserWindow* win, int tabId) {
     // --- Fullscreen video support ---
     web->add_ContainsFullScreenElementChanged(
         Microsoft::WRL::Callback<ICoreWebView2ContainsFullScreenElementChangedEventHandler>(
-            [win, tabId](ICoreWebView2* sender, IUnknown*) -> HRESULT {
-                if (!sender || !WinAlive(win)) return S_OK;
+            [tabId](ICoreWebView2* sender, IUnknown*) -> HRESULT {
+                BrowserWindow* win = WinFromTabId(tabId);
+                if (!sender || !win) return S_OK;
                 int i = TabIndexById(win, tabId);
                 if (i < 0 || i != win->active) return S_OK;
 
@@ -1124,25 +1537,31 @@ static void EnsureWebViewEnv(std::function<void()> onReady) {
             }).Get());
 }
 
-static void CreateWebViewForTab(BrowserWindow* win, int tabId) {
-    int idx = TabIndexById(win, tabId);
-    if (idx < 0 || win->tabs[idx].ctl) return;
+static void CreateWebViewForTab(BrowserWindow* owner, int tabId) {
+    int idx = TabIndexById(owner, tabId);
+    if (idx < 0 || owner->tabs[idx].ctl || owner->tabs[idx].creating) return;
 
-    EnsureWebViewEnv([win, tabId]() {
-        if (!WinAlive(win) || !g_env) return;
+    EnsureWebViewEnv([tabId]() {
+        BrowserWindow* win = WinFromTabId(tabId);
+        if (!win || !g_env) return;
         int i = TabIndexById(win, tabId);
-        if (i < 0 || win->tabs[i].ctl) return;
+        if (i < 0 || win->tabs[i].ctl || win->tabs[i].creating) return;
+        win->tabs[i].creating = true;
 
-        g_env->CreateCoreWebView2Controller(win->client,
+        HWND parent = win->client;
+        g_env->CreateCoreWebView2Controller(parent,
             Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                [win, tabId](HRESULT hr2, ICoreWebView2Controller* ctl)->HRESULT {
+                [tabId, parent](HRESULT hr2, ICoreWebView2Controller* ctl)->HRESULT {
+                    BrowserWindow* win = WinFromTabId(tabId);
+                    int i = win ? TabIndexById(win, tabId) : -1;
+                    if (i >= 0) win->tabs[i].creating = false;
                     if (FAILED(hr2) || !ctl) return hr2 ? hr2 : E_FAIL;
-                    if (!WinAlive(win)) { ctl->Close(); return S_OK; }
-                    int i = TabIndexById(win, tabId);
                     if (i < 0) { ctl->Close(); return S_OK; }
 
                     win->tabs[i].ctl = ctl;
                     ctl->get_CoreWebView2(&win->tabs[i].web);
+                    // The tab may have been dragged to another window while this was pending.
+                    if (win->client != parent) ctl->put_ParentWindow(win->client);
 
                     ComPtr<ICoreWebView2> wv = win->tabs[i].web;
                     ComPtr<ICoreWebView2_13> wv13;
@@ -1230,6 +1649,14 @@ static LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         if (self->active >= 0 && self->active < (int)self->tabs.size() && !self->tabs[self->active].ctl)
             CreateWebViewForTab(self, self->tabs[self->active].id);
         return 0;
+    case WM_APP_DROP_TAB: {
+        std::unique_ptr<TabDrop> drop((TabDrop*)lParam);
+        DropDraggedTab(*drop);
+        return 0;
+    }
+    case WM_APP_CLOSE_TAB:
+        CloseTab(self, TabIndexById(self, (int)wParam));
+        return 0;
     case WM_SIZE:
         LayoutToolbarAndTabs(self);
         if (self->suggestVisible) { int cnt = (int)SendMessageW(self->suggest, LB_GETCOUNT, 0, 0); if (cnt > 0) PositionSuggestBelowEdit(self, cnt); }
@@ -1249,7 +1676,11 @@ static LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 if (!self->settingUrl && GetFocus() == self->editUrl) { self->editDirty = true; wchar_t q[2048] = L""; GetWindowTextW(self->editUrl, q, 2048); PopulateSuggestions(self, q); }
                 return 0;
             }
-            if (code == EN_KILLFOCUS) { self->editDirty = false; return 0; }
+            if (code == EN_KILLFOCUS) {
+                self->editDirty = false;
+                if (GetFocus() != self->suggest) HideSuggestions(self);
+                return 0;
+            }
         }
         if (id == IDC_SUGGEST) {
             if (code == LBN_SELCHANGE) { ApplySuggestSelectionToEdit(self); return 0; }
@@ -1267,7 +1698,7 @@ static LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             }
             if (id == IDC_RELOAD) {
                 if (self->active >= 0 && self->tabs[self->active].web) {
-                    if (self->isLoading) self->tabs[self->active].web->Stop();
+                    if (self->tabs[self->active].loading) self->tabs[self->active].web->Stop();
                     else self->tabs[self->active].web->Reload();
                 }
                 return 0;
@@ -1289,11 +1720,90 @@ static LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+// The Jump to File Extra plugin (gen_jumpex) hooks every embedded frame and, from the
+// moment one is activated until it is next clicked, strips the move out of any request
+// to reposition it while it is the active window. Tools such as AltSnap move windows
+// from outside, so after an Alt+Tab the frame could only be resized down and right:
+// growing it up or left needs it to move. The plugin lets the next two position changes
+// through once it has seen this message, so sending it ahead of each one keeps the
+// frame movable. Nothing else in Winamp acts on it.
+static void AllowOutsideMoves(HWND frame) { SendMessageW(frame, WM_USER, 0, 2003); }
+
 static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     BrowserWindow* self = WinFromFrame(hwnd);
     WNDPROC prev = self ? self->prevFrameProc : nullptr;
     switch (msg) {
-    case WM_SHOWWINDOW: if (wParam && self && self->client) PostMessage(self->client, WM_APP_INIT_WEBVIEW, 0, 0); break;
+    case WM_ACTIVATE:
+    case WM_ACTIVATEAPP:
+    case WM_WINDOWPOSCHANGING:
+        AllowOutsideMoves(hwnd);
+        break;
+    case WM_WINDOWPOSCHANGED:
+        if (self && prev) {
+            // A minimized frame is a sliver parked far off screen. Winamp would lay the
+            // frame's contents out to fit it and remember that as the window's place, so
+            // it isn't told. The pages just hear that they are out of sight meanwhile.
+            const WINDOWPOS* wp = (const WINDOWPOS*)lParam;
+            bool was = self->minimized;
+            self->minimized = IsIconic(hwnd) || (!(wp->flags & SWP_NOMOVE) && wp->x <= -32000 && wp->y <= -32000);
+            if (self->minimized) {
+                if (!was && !self->isFullscreen) HideAllWebViews(self);
+                return 0;
+            }
+            LRESULT r = CallWindowProc(prev, hwnd, msg, wParam, lParam);
+            // Winamp only follows the frame's position when it does the moving itself.
+            // Without this a move from outside is forgotten when the position is saved.
+            if (!(GetWindowLongPtr(hwnd, GWL_STYLE) & WS_CHILD)) GetWindowRect(hwnd, &self->ews.r);
+            if (was) LayoutActiveWebView(self);
+            return r;
+        }
+        break;
+    case WM_NCCALCSIZE:
+        // No system border: the whole window stays client area (see EnableSnapAndMaximize).
+        if (!(GetWindowLongPtr(hwnd, GWL_STYLE) & WS_CHILD)) return 0;
+        break;
+    case WM_GETMINMAXINFO: {
+        LRESULT r = prev ? CallWindowProc(prev, hwnd, msg, wParam, lParam) : 0;
+        MINMAXINFO* mm = (MINMAXINFO*)lParam;
+        MONITORINFO mi{ sizeof(mi) };
+        if (mm && GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+            // Maximized means the work area exactly. Left to itself Windows adds the
+            // width of the border the frame doesn't have and hangs its edges off screen.
+            mm->ptMaxPosition = { mi.rcWork.left - mi.rcMonitor.left, mi.rcWork.top - mi.rcMonitor.top };
+            mm->ptMaxSize = { mi.rcWork.right - mi.rcWork.left, mi.rcWork.bottom - mi.rcWork.top };
+            mm->ptMinTrackSize = { 275, 116 }; // the smallest frame Winamp can draw
+        }
+        return r;
+    }
+    case WM_LBUTTONDOWN:
+        // Winamp moves and sizes the frame by hand, which would leave a maximized one
+        // still counted as maximized. It becomes a normal window first: under the cursor
+        // for a title bar drag, as Windows does it, and where it is for the resize grip.
+        if (IsZoomed(hwnd)) {
+            RECT zr; GetWindowRect(hwnd, &zr);
+            int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
+            int w = zr.right - zr.left, h = zr.bottom - zr.top;
+            WINDOWPLACEMENT wp{ sizeof(wp) };
+            if (y < 14 && x < w - 12 && GetWindowPlacement(hwnd, &wp)) {
+                int nw = wp.rcNormalPosition.right - wp.rcNormalPosition.left;
+                int nh = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+                int nx = MulDiv(x, nw, max(1, w)); // the same way along the title bar
+                RECT to = { zr.left + x - nx, zr.top, zr.left + x - nx + nw, zr.top + nh };
+                RestoreFrameTo(hwnd, to);
+                lParam = MAKELPARAM(nx, y);
+            }
+            else if (x > w - 20 && y > h - 20) RestoreFrameTo(hwnd, zr);
+        }
+        break;
+    case WM_SHOWWINDOW:
+        // lParam is zero for a show/hide of this window itself, as opposed to one that
+        // follows Winamp being minimized or restored.
+        if (self && !lParam && self->menuId != (UINT_PTR)-1) CheckEmbeddedWindowMenus((UINT)self->menuId, wParam ? TRUE : FALSE);
+        if (wParam && self && self->client) PostMessage(self->client, WM_APP_INIT_WEBVIEW, 0, 0);
+        if (wParam) DetachFromWinampWindows(hwnd); // in case Winamp gave it its owner back
+        // Shown from Winamp's menu after being hidden while minimized: come all the way back.
+        if (wParam && !lParam && IsIconic(hwnd)) PostMessage(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
+        break;
     case WM_ERASEBKGND: { RECT r; GetClientRect(hwnd, &r); FillRect((HDC)wParam, &r, g_brBlack ? g_brBlack : (HBRUSH)GetStockObject(BLACK_BRUSH)); return 1; }
     case WM_SIZE: if (self && self->client) { RECT fr; GetClientRect(hwnd, &fr); SetWindowPos(self->client, 0, 8, 24, fr.right - 8, fr.bottom - 24, SWP_NOZORDER | SWP_NOACTIVATE); } break;
     case WM_NCDESTROY: if (self && self->prevFrameProc) { SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)self->prevFrameProc); self->prevFrameProc = nullptr; } break;
@@ -1302,7 +1812,7 @@ static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 }
 
 // ---- Winamp plumbing ----
-static BrowserWindow* CreateBrowserWindow(bool show)
+static BrowserWindow* CreateBrowserWindow(bool show, const RECT* place /*= nullptr*/, bool forDroppedTab /*= false*/)
 {
     EnsureGlobals();
 
@@ -1321,9 +1831,15 @@ static BrowserWindow* CreateBrowserWindow(bool show)
     SetWindowTextW(win->embedFrame, L"Exodium");
     win->prevFrameProc = (WNDPROC)SetWindowLongPtr(win->embedFrame, GWLP_WNDPROC, (LONG_PTR)FrameProc);
     EnableTaskbarButton(win->embedFrame);
+    DetachFromWinampWindows(win->embedFrame);
+    EnableSnapAndMaximize(win->embedFrame);
 
+    if (place) {
+        SetWindowPos(win->embedFrame, nullptr, place->left, place->top,
+            place->right - place->left, place->bottom - place->top, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     // Cascade additional windows so they don't stack exactly on the first.
-    if (g_windows.size() > 1) {
+    else if (g_windows.size() > 1) {
         RECT wr; GetWindowRect(win->embedFrame, &wr);
         int off = (int)(g_windows.size() - 1) * 30;
         SetWindowPos(win->embedFrame, nullptr, wr.left + off, wr.top + off, 0, 0,
@@ -1335,16 +1851,20 @@ static BrowserWindow* CreateBrowserWindow(bool show)
         8, 24, fr.right - 8, fr.bottom - 24,
         win->embedFrame, nullptr, g_hInst, win);
 
-    // Initial tab
-    win->tabs.push_back(Tab{});
-    win->tabs[0].id = win->nextTabId++;
-    win->active = 0;
+    // Initial tab. A window made to receive a dragged-out tab starts empty instead;
+    // the caller places and shows it once that tab is in.
+    if (!forDroppedTab) {
+        win->tabs.push_back(Tab{});
+        win->tabs[0].id = g_nextTabId++;
+        win->active = 0;
+    }
     LayoutToolbarAndTabs(win);
 
     // Per-window menu entry so each window can be toggled from Winamp.
     win->menuId = (UINT_PTR)SendMessage(plugin.hwndParent, WM_WA_IPC, 0, IPC_REGISTER_LOWORD_COMMAND);
     wchar_t menuTitle[] = L"Exodium";
     AddEmbeddedWindowToMenus(TRUE, (UINT)win->menuId, menuTitle, show ? TRUE : FALSE);
+    if (forDroppedTab) return win;
 
     if (show) ShowWindow(win->embedFrame, SW_SHOWNA);
     PostMessage(win->client, WM_APP_INIT_WEBVIEW, 0, 0);
@@ -1354,6 +1874,11 @@ static BrowserWindow* CreateBrowserWindow(bool show)
 static void DestroyBrowserWindow(BrowserWindow* win)
 {
     if (win->fsWnd) { DestroyWindow(win->fsWnd); win->fsWnd = nullptr; }
+
+    // A maximized or minimized window is remembered at the size it goes back to.
+    WINDOWPLACEMENT wp{ sizeof(wp) };
+    if (win->embedFrame && (IsZoomed(win->embedFrame) || IsIconic(win->embedFrame)) && GetWindowPlacement(win->embedFrame, &wp))
+        win->ews.r = wp.rcNormalPosition;
 
     for (auto& t : win->tabs) {
         if (t.ctl) t.ctl->Close();
@@ -1390,6 +1915,8 @@ static int __cdecl init()
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     Gdiplus::GdiplusStartupInput gdiplusStartupInput;
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, nullptr);
+
+    ini_file = (wchar_t*)SendMessage(plugin.hwndParent, WM_WA_IPC, 0, IPC_GETINIFILEW);
 
     EnsureGlobals();
     HookWinampParent();

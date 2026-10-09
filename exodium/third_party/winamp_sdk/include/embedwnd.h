@@ -22,6 +22,7 @@ HWND CreateEmbeddedWindow(embedWindowState* embedWindow, const GUID embedWindowG
 void AddEmbeddedWindowToMenus(BOOL add, UINT menuId, LPWSTR menuString, BOOL visible);
 void ShowEmbeddedWindow(HWND embeddedWindow);
 void UpdateEmbeddedWindowsMenu(UINT menuId);
+void CheckEmbeddedWindowMenus(UINT menuId, BOOL checked);
 void DestroyEmbeddedWindow(embedWindowState* embedWindow);
 BOOL SetEmbeddedWindowMinimizedMode(HWND embeddedWindow, BOOL fMinimized);
 BOOL EmbeddedWindowIsMinimizedMode(HWND embeddedWindow);

@@ -22,6 +22,9 @@
 #include <memory>
 #include <algorithm>
 #include <cstdio>
+#include <ctime>
+#include <cmath>
+#include <map>
 #include <functional>
 #include "WebView2.h"
 
@@ -88,6 +91,17 @@ struct Tab {
     int id = 0;                 // stable id for async event routing
     bool creating = false;      // a controller is being created for this tab
     bool loading = false;       // a navigation is in progress
+    bool typedNav = false;      // that navigation was asked for by address in the address bar
+    double zoom = 1.0;          // the zoom factor this tab's webview was last given
+};
+
+// One row of the list under the address bar.
+struct Suggestion {
+    std::wstring text;          // what the address bar shows for it
+    std::wstring title;         // the page's title, when one is known
+    std::wstring url;           // where it goes
+    bool search = false;        // a Google search for text, not a page
+    double score = 0;
 };
 
 struct BrowserWindow {
@@ -103,6 +117,10 @@ struct BrowserWindow {
 
     HWND suggest = nullptr;
     bool suggestVisible = false;
+    std::vector<Suggestion> suggestions;   // the list's rows; Enter goes to the selected one
+    std::wstring userText;         // the address bar's text as typed, with nothing suggested in it
+    std::wstring inlineText;       // the completion shown selected after userText, if any
+    bool typingChar = false;       // the address bar is taking a typed character right now
 
     bool editDirty = false;
     bool settingUrl = false;
@@ -141,7 +159,15 @@ static TabDrag g_drag;
 struct TabDrop { int tabId; POINT pt; POINT grab; };
 
 // ---- shared history / closed tabs ----
-static std::vector<std::wstring> g_history;
+struct HistoryEntry {
+    std::wstring url;
+    std::wstring title;
+    int visits = 0;            // page loads that ended on this URL
+    int typed = 0;             // how many of them were asked for by address in the address bar
+    __int64 last = 0;          // when the latest was, in seconds since 1970; 0 if not known
+};
+static std::vector<HistoryEntry> g_history;   // most recently visited first
+static const size_t kHistoryMax = 2000;
 struct ClosedTab { std::wstring url; };
 static std::vector<ClosedTab> g_closedTabs;
 
@@ -186,31 +212,82 @@ static bool IsLikelyHttpUrl(const std::wstring& u) {
     if (u.empty()) return false;
     return StrCmpNIW(u.c_str(), L"http://", 7) == 0 || StrCmpNIW(u.c_str(), L"https://", 8) == 0 || StrCmpNIW(u.c_str(), L"file://", 7) == 0;
 }
-static void AddToHistory(const std::wstring& url) {
+static std::wstring TrimSpaces(const std::wstring& s) {
+    const wchar_t* ws = L" \t\r\n";
+    size_t b = s.find_first_not_of(ws);
+    return b == std::wstring::npos ? L"" : s.substr(b, s.find_last_not_of(ws) - b + 1);
+}
+static HistoryEntry* FindInHistory(const std::wstring& url) {
+    for (auto& h : g_history) if (_wcsicmp(h.url.c_str(), url.c_str()) == 0) return &h;
+    return nullptr;
+}
+// Titles are kept one to a line of the history file, between tabs.
+static void SetHistoryTitle(HistoryEntry& h, const wchar_t* title) {
+    h.title = title ? title : L"";
+    for (auto& c : h.title) if (c == L'\t' || c == L'\r' || c == L'\n') c = L' ';
+    if (h.title.size() > 200) h.title.resize(200);
+}
+static void AddToHistory(const std::wstring& url, const wchar_t* title, bool typed) {
     if (!IsLikelyHttpUrl(url)) return;
-    auto it = std::remove_if(g_history.begin(), g_history.end(), [&](const std::wstring& s) { return _wcsicmp(s.c_str(), url.c_str()) == 0; });
-    if (it != g_history.end()) g_history.erase(it, g_history.end());
-    g_history.insert(g_history.begin(), url);
-    if (g_history.size() > 200) g_history.resize(200);
+    HistoryEntry e; e.url = url;
+    if (HistoryEntry* old = FindInHistory(url)) { e = std::move(*old); g_history.erase(g_history.begin() + (old - g_history.data())); }
+    e.visits++; if (typed) e.typed++;
+    e.last = _time64(nullptr);
+    if (title && *title) SetHistoryTitle(e, title);
+    g_history.insert(g_history.begin(), std::move(e));
+    if (g_history.size() > kHistoryMax) g_history.resize(kHistoryMax);
 }
 static void LoadHistory() {
     g_history.clear();
     std::wstring path = HistoryFilePath();
     FILE* f = nullptr; if (_wfopen_s(&f, path.c_str(), L"rt, ccs=UNICODE") != 0 || !f) return;
     wchar_t buf[4096];
-    while (fgetws(buf, ARRAYSIZE(buf), f)) {
-        std::wstring line = buf; TrimCRLF(line); if (line.empty() || !IsLikelyHttpUrl(line)) continue;
-        bool exists = false; for (auto& s : g_history) { if (!_wcsicmp(s.c_str(), line.c_str())) { exists = true; break; } }
-        if (!exists) g_history.push_back(line);
+    while (g_history.size() < kHistoryMax && fgetws(buf, ARRAYSIZE(buf), f)) {
+        std::wstring line = buf; TrimCRLF(line);
+        // URL, visits, typed visits, time of the last visit, title. Files from before
+        // visits were counted hold the URL alone.
+        std::vector<std::wstring> col;
+        for (size_t b = 0;;) {
+            size_t e = line.find(L'\t', b);
+            col.push_back(line.substr(b, e == std::wstring::npos ? e : e - b));
+            if (e == std::wstring::npos) break;
+            b = e + 1;
+        }
+        if (!IsLikelyHttpUrl(col[0]) || FindInHistory(col[0])) continue;
+        HistoryEntry h; h.url = col[0];
+        h.visits = col.size() > 1 ? max(1, _wtoi(col[1].c_str())) : 1;
+        h.typed = col.size() > 2 ? max(0, _wtoi(col[2].c_str())) : 0;
+        h.last = col.size() > 3 ? _wtoi64(col[3].c_str()) : 0;
+        if (col.size() > 4) h.title = col[4];
+        g_history.push_back(std::move(h));
     }
     fclose(f);
-    std::reverse(g_history.begin(), g_history.end());
-    if (g_history.size() > 200) g_history.resize(200);
 }
 static void SaveHistory() {
     std::wstring path = HistoryFilePath();
     FILE* f = nullptr; if (_wfopen_s(&f, path.c_str(), L"wt, ccs=UNICODE") != 0 || !f) return;
-    for (const auto& u : g_history) { fputws(u.c_str(), f); fputwc(L'\n', f); }
+    for (const auto& h : g_history) fwprintf(f, L"%s\t%d\t%d\t%lld\t%s\n", h.url.c_str(), h.visits, h.typed, h.last, h.title.c_str());
+    fclose(f);
+}
+
+// Zoom factors by site: the host in lower case. A site at the normal size has no entry.
+static std::map<std::wstring, double> g_zoom;
+static std::wstring ZoomFilePath() { return DataDirPath() + L"\\zoom.txt"; }
+static void LoadZoom() {
+    g_zoom.clear();
+    FILE* f = nullptr; if (_wfopen_s(&f, ZoomFilePath().c_str(), L"rt, ccs=UNICODE") != 0 || !f) return;
+    wchar_t buf[512];
+    while (fgetws(buf, ARRAYSIZE(buf), f)) {
+        std::wstring line = buf; TrimCRLF(line);
+        size_t tab = line.find(L'\t'); if (tab == std::wstring::npos || tab == 0) continue;
+        double z = _wtof(line.c_str() + tab + 1);
+        if (z >= 0.25 && z <= 5.0) g_zoom[line.substr(0, tab)] = z;
+    }
+    fclose(f);
+}
+static void SaveZoom() {
+    FILE* f = nullptr; if (_wfopen_s(&f, ZoomFilePath().c_str(), L"wt, ccs=UNICODE") != 0 || !f) return;
+    for (const auto& z : g_zoom) fwprintf(f, L"%s\t%.4f\n", z.first.c_str(), z.second);
     fclose(f);
 }
 
@@ -222,7 +299,7 @@ static void NextTab(BrowserWindow* win);
 static void PrevTab(BrowserWindow* win);
 static void CloseActiveTab(BrowserWindow* win);
 static void SubclassCtrlCommon(HWND h);
-static void ApplySuggestSelectionToEdit(BrowserWindow* win);
+static void ResetSiteZoom(BrowserWindow* win);
 static LRESULT CALLBACK SuggestSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR);
 static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -239,6 +316,18 @@ static void LeaveVideoFullscreen(BrowserWindow* win);
 static LRESULT CALLBACK FullscreenProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 static void FocusAddressBar(BrowserWindow* win) { SetFocus(win->editUrl); SendMessageW(win->editUrl, EM_SETSEL, 0, -1); }
+static std::wstring UrlBoxText(BrowserWindow* win) { wchar_t buf[2048] = L""; GetWindowTextW(win->editUrl, buf, ARRAYSIZE(buf)); return buf; }
+static void SetUrlBoxText(BrowserWindow* win, const std::wstring& text) { win->settingUrl = true; SetWindowTextW(win->editUrl, text.c_str()); win->settingUrl = false; }
+// Shows a page's address in the address bar. A bar that has the keyboard with all of
+// its text selected, as on a new tab, gets the new address selected as well, so that
+// typing replaces it whenever the page gets round to changing it.
+static void ShowPageUrl(BrowserWindow* win, const wchar_t* url) {
+    DWORD from = 0, to = 0;
+    SendMessageW(win->editUrl, EM_GETSEL, (WPARAM)&from, (LPARAM)&to);
+    bool whole = GetFocus() == win->editUrl && from == 0 && (int)to == GetWindowTextLengthW(win->editUrl);
+    SetUrlBoxText(win, url ? url : L"");
+    if (whole) SendMessageW(win->editUrl, EM_SETSEL, 0, -1);
+}
 static std::wstring GetActiveUrl(BrowserWindow* win) {
     if (win->active < 0 || win->active >= (int)win->tabs.size() || !win->tabs[win->active].web) return L"";
     LPWSTR uri = nullptr; std::wstring out; if (SUCCEEDED(win->tabs[win->active].web->get_Source(&uri))) { if (uri) { out = uri; CoTaskMemFree(uri); } } return out;
@@ -248,7 +337,7 @@ static void UpdateUrlBox(BrowserWindow* win) {
     if (win->active < 0 || win->active >= (int)win->tabs.size()) return;
     // A tab whose webview isn't up yet shows where it is headed.
     std::wstring url = win->tabs[win->active].web ? GetActiveUrl(win) : win->tabs[win->active].pendingUri;
-    win->settingUrl = true; SetWindowTextW(win->editUrl, url.c_str()); win->settingUrl = false;
+    ShowPageUrl(win, url.c_str());
 }
 static void UpdateReloadButton(BrowserWindow* win)
 {
@@ -348,8 +437,9 @@ static bool HandleGlobalShortcut(BrowserWindow* win, WPARAM w, bool ctrl, bool s
     if (ctrl && shift && !alt && w == 'T') { ReopenLastClosedTab(win); return true; }
 
     if (ctrl && !shift && !alt && w == 'L') { FocusAddressBar(win); win->editDirty = true; return true; }
-    if (ctrl && !alt && !shift && w == 'T') { NewTab(win); return true; }
+    if (ctrl && !alt && !shift && w == 'T') { NewTab(win); FocusAddressBar(win); return true; }
     if (ctrl && !alt && !shift && w == 'W') { CloseActiveTab(win); return true; }
+    if (ctrl && !alt && !shift && (w == '0' || w == VK_NUMPAD0)) { ResetSiteZoom(win); return true; }
 
     if (ctrl && !alt && w == VK_TAB) {
         if (shift) PrevTab(win); else NextTab(win);
@@ -364,18 +454,6 @@ static bool HandleGlobalShortcut(BrowserWindow* win, WPARAM w, bool ctrl, bool s
     }
 
     return false;
-}
-
-static void ApplySuggestSelectionToEdit(BrowserWindow* win) {
-    if (!win->suggestVisible || !win->suggest || !win->editUrl) return;
-    LRESULT sel = SendMessageW(win->suggest, LB_GETCURSEL, 0, 0);
-    if (sel == LB_ERR) return;
-    wchar_t buf[2048] = L"";
-    SendMessageW(win->suggest, LB_GETTEXT, (WPARAM)sel, (LPARAM)buf);
-    win->settingUrl = true;
-    SetWindowTextW(win->editUrl, buf);
-    win->settingUrl = false;
-    SendMessageW(win->editUrl, EM_SETSEL, 0, -1);
 }
 
 static bool LooksLikeDomain(const std::wstring& s) {
@@ -401,6 +479,16 @@ static std::wstring BuildGoogleQuery(const std::wstring& q) {
     std::wstring url = L"https://www.google.com/search?q=";
     url += enc;
     return url;
+}
+
+// Where text entered in the address bar leads: a URL as it stands, a bare domain
+// over https, and anything else to a search for it.
+static std::wstring UrlForInput(const std::wstring& input, bool* isSearch) {
+    *isSearch = false;
+    if (PathIsURLW(input.c_str())) return input;
+    if (LooksLikeDomain(input)) return L"https://" + input;
+    *isSearch = true;
+    return BuildGoogleQuery(input);
 }
 
 static LRESULT CALLBACK WaSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -456,6 +544,7 @@ static void EnsureGlobals()
     RegisterClassW(&wcgh);
 
     LoadHistory();
+    LoadZoom();
 
     g_globalsReady = true;
 }
@@ -511,15 +600,36 @@ static void DrawOwnerButton(const DRAWITEMSTRUCT* dis, bool isTab, bool isActive
 }
 
 // ---------- suggestions ----------
-static void HideSuggestions(BrowserWindow* win) { if (win->suggest) ShowWindow(win->suggest, SW_HIDE); win->suggestVisible = false; }
+// The address bar works the way Chrome's does. The top row of the list is always what
+// Enter will do. When an address in the history begins with what has been typed, it
+// takes that row and the rest of it is filled in after the caret, selected, so that
+// typing on replaces it. Otherwise the top row is the typed text itself, as an
+// address or a search. Up and Down try the other rows out in the box.
+static const int kMaxSuggestions = 8;
+static const double kCompleteMinWorth = 2.0; // in Frecency()'s terms: two fresh visits, or four older ones
+static const COLORREF kColSuggestSel = RGB(52, 52, 52), kColSuggestDim = RGB(150, 150, 150), kColSuggestUrl = RGB(138, 180, 248);
+
+#ifndef URL_UNESCAPE_AS_UTF8
+#define URL_UNESCAPE_AS_UTF8 0x00040000 // shlwapi.h leaves it out of builds that target Windows 7
+#endif
+
+static void HideSuggestions(BrowserWindow* win) { if (win->suggest) ShowWindow(win->suggest, SW_HIDE); win->suggestVisible = false; win->inlineText.clear(); }
 static void EnsureSuggestListbox(BrowserWindow* win) {
     if (!win->suggest) {
         win->suggest = CreateWindowExW(
             WS_EX_TOOLWINDOW, L"LISTBOX", L"",
-            WS_CHILD | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER,
+            WS_CHILD | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | WS_BORDER,
             0, 0, 0, 0, win->client, (HMENU)IDC_SUGGEST, g_hInst, nullptr);
         SendMessageW(win->suggest, WM_SETFONT, (WPARAM)g_font, TRUE);
         SetWindowSubclass(win->suggest, SuggestSubproc, 2, 0);
+
+        TEXTMETRICW tm = {};
+        HDC dc = GetDC(win->suggest);
+        HGDIOBJ oldf = SelectObject(dc, g_font ? g_font : GetStockObject(DEFAULT_GUI_FONT));
+        GetTextMetricsW(dc, &tm);
+        SelectObject(dc, oldf);
+        ReleaseDC(win->suggest, dc);
+        SendMessageW(win->suggest, LB_SETITEMHEIGHT, 0, tm.tmHeight + 8);
     }
 }
 static void PositionSuggestBelowEdit(BrowserWindow* win, int items) {
@@ -527,43 +637,273 @@ static void PositionSuggestBelowEdit(BrowserWindow* win, int items) {
     POINT tl{ er.left,er.bottom }, br{ er.right,er.bottom };
     ScreenToClient(win->client, &tl); ScreenToClient(win->client, &br);
     int itemH = (int)SendMessageW(win->suggest, LB_GETITEMHEIGHT, 0, 0); if (itemH <= 0) itemH = 18;
-    int h = min(items, 8) * itemH + 2, w = (br.x - tl.x);
+    int h = min(items, kMaxSuggestions) * itemH + 2, w = (br.x - tl.x);
     SetWindowPos(win->suggest, HWND_TOP, tl.x, tl.y, w, h, SWP_SHOWWINDOW);
 }
-static void PopulateSuggestions(BrowserWindow* win, const std::wstring& q) {
-    EnsureSuggestListbox(win); SendMessageW(win->suggest, LB_RESETCONTENT, 0, 0);
-    if (q.size() < 2) { HideSuggestions(win); return; }
-    auto wlower = [](std::wstring s) { for (auto& c : s) c = (wchar_t)towlower(c); return s; };
-    std::wstring ql = wlower(q); std::vector<std::wstring> matches;
-    auto add_if = [&](const std::wstring& s) {
-        if (matches.size() >= 64) return;
-        if (std::any_of(matches.begin(), matches.end(), [&](const std::wstring& x) {return _wcsicmp(x.c_str(), s.c_str()) == 0; })) return;
-        matches.push_back(s);
-        };
-    for (const auto& u : g_history) { std::wstring ul = wlower(u); if (ul.find(ql) == 0) add_if(u); }
-    for (const auto& u : g_history) { std::wstring ul = wlower(u); if (!ul.empty() && ul.find(ql) != 0 && ul.find(ql) != std::wstring::npos) add_if(u); }
-    if (matches.empty()) { HideSuggestions(win); return; }
-    for (const auto& s : matches) SendMessageW(win->suggest, LB_ADDSTRING, 0, (LPARAM)s.c_str());
-    SendMessageW(win->suggest, LB_SETCURSEL, 0, 0); PositionSuggestBelowEdit(win, (int)matches.size()); win->suggestVisible = true;
+
+static void DrawSuggestion(BrowserWindow* win, const DRAWITEMSTRUCT* dis) {
+    if (dis->itemID >= win->suggestions.size()) return; // an empty list asks for item -1
+    const Suggestion& s = win->suggestions[dis->itemID];
+    HDC dc = dis->hDC;
+    RECT r = dis->rcItem;
+
+    HBRUSH br = CreateSolidBrush((dis->itemState & ODS_SELECTED) ? kColSuggestSel : g_colPanel);
+    FillRect(dc, &r, br);
+    DeleteObject(br);
+
+    // A page reads "Title - address" and a search "words - Google Search". An address
+    // whose title isn't known stands alone.
+    const bool titled = !s.search && !s.title.empty();
+    const std::wstring& lead = titled ? s.title : s.text;
+    std::wstring tail;
+    if (s.search) tail = L" - Google Search";
+    else if (titled) tail = L" - " + s.text;
+
+    SetBkMode(dc, TRANSPARENT);
+    HFONT oldf = (HFONT)SelectObject(dc, g_font ? g_font : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+    InflateRect(&r, -6, 0);
+    SIZE ls = {}, ts = {};
+    GetTextExtentPoint32W(dc, lead.c_str(), (int)lead.size(), &ls);
+    GetTextExtentPoint32W(dc, tail.c_str(), (int)tail.size(), &ts);
+
+    // When the two don't fit, the first gives way, but not past half the row.
+    const int width = r.right - r.left;
+    RECT lr = r; lr.right = lr.left + min((int)ls.cx, max(width - (int)ts.cx, width / 2));
+    RECT tr = r; tr.left = lr.right;
+    const UINT fmt = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
+    SetTextColor(dc, (s.search || titled) ? g_colText : kColSuggestUrl);
+    DrawTextW(dc, lead.c_str(), -1, &lr, fmt);
+    SetTextColor(dc, s.search ? kColSuggestDim : kColSuggestUrl);
+    DrawTextW(dc, tail.c_str(), -1, &tr, fmt);
+    SelectObject(dc, oldf);
 }
-static void CommitSuggestion(BrowserWindow* win, bool navigate) {
-    if (!win->suggestVisible) return;
-    LRESULT sel = SendMessageW(win->suggest, LB_GETCURSEL, 0, 0); if (sel == LB_ERR) return;
-    wchar_t buf[2048] = L""; SendMessageW(win->suggest, LB_GETTEXT, (WPARAM)sel, (LPARAM)buf);
-    win->settingUrl = true; SetWindowTextW(win->editUrl, buf); win->settingUrl = false;
-    HideSuggestions(win); SetFocus(win->editUrl); SendMessageW(win->editUrl, EM_SETSEL, 0, -1);
-    if (navigate) { win->editDirty = false; NavigateFromUrlBox(win); }
+
+// How much a history entry is worth suggesting. A visit counts for more when the
+// address was typed in, and all of them for less the longer ago the last one was.
+static double Frecency(const HistoryEntry& h, __int64 now) {
+    double days = h.last ? (double)(now - h.last) / 86400.0 : 30.0; // not dated: taken as a month old
+    double age = days <= 4 ? 1.0 : days <= 14 ? 0.7 : days <= 31 ? 0.5 : days <= 90 ? 0.3 : 0.1;
+    return (min(h.visits, 20) + 4.0 * min(h.typed, 20)) * age;
 }
-// Closes the list and hands the keyboard back to the address bar with the picked
-// suggestion left in it, caret at the end, ready to be edited or added to.
-static void EditPickedSuggestion(BrowserWindow* win) {
-    HideSuggestions(win);
-    if (!win->editUrl) return;
-    SetFocus(win->editUrl);
+
+// Where the parts of an address begin. A web address is shown and matched from
+// `bare` on: nobody types the scheme or the "www.", so neither should be needed.
+struct UrlSpan {
+    size_t www;      // past the scheme of a web address; 0 for anything else
+    size_t bare;     // past a "www." as well
+    size_t hostEnd;  // where a web address's host ends
+    bool web;
+};
+static UrlSpan SpanOf(const std::wstring& u) {
+    UrlSpan s = {};
+    if (StrCmpNIW(u.c_str(), L"https://", 8) == 0) s.www = 8;
+    else if (StrCmpNIW(u.c_str(), L"http://", 7) == 0) s.www = 7;
+    s.web = s.www != 0;
+    s.bare = s.www + (StrCmpNIW(u.c_str() + s.www, L"www.", 4) == 0 ? 4 : 0);
+    s.hostEnd = s.web ? min(u.find_first_of(L"/?#", s.bare), u.size()) : 0;
+    return s;
+}
+// An address as the list shows it: from `bare` on, less the slash that ends a bare host.
+static std::wstring ShownUrl(const std::wstring& url, const UrlSpan& sp) {
+    std::wstring t = url.substr(sp.bare);
+    if (sp.web && url.size() == sp.hostEnd + 1 && url.back() == L'/') t.pop_back();
+    return t;
+}
+
+// Whether the address is a Google results page, and the words searched for on it if
+// it names any. Past searches are offered as searches, not as the long addresses
+// they left behind.
+static bool SearchPageQuery(const std::wstring& url, const UrlSpan& sp, std::wstring& q) {
+    q.clear();
+    if (!sp.web || StrCmpNIW(url.c_str() + sp.bare, L"google.com/search?", 18) != 0) return false;
+    size_t p = sp.bare + 17; // each turn of the loop it is on the '?' or '&' that starts a parameter
+    while (url.compare(p + 1, 2, L"q=") != 0) {
+        p = url.find(L'&', p + 1);
+        if (p == std::wstring::npos) return true;
+    }
+    size_t b = p + 3, e = url.find_first_of(L"&#", b);
+    q = url.substr(b, e == std::wstring::npos ? e : e - b);
+    if (q.empty()) return true;
+    std::replace(q.begin(), q.end(), L'+', L' ');
+    UrlUnescapeW(&q[0], nullptr, nullptr, URL_UNESCAPE_INPLACE | URL_UNESCAPE_AS_UTF8);
+    q.resize(wcslen(q.c_str()));
+    q = TrimSpaces(q);
+    return true;
+}
+
+// How well `term` is found in `s`: best at the very start, then at the start of a
+// word, least inside one. 0 when it isn't there at all.
+static int MatchWeight(const wchar_t* s, const wchar_t* term) {
+    int best = 0;
+    for (const wchar_t* p = StrStrIW(s, term); p && best < 2; p = StrStrIW(p + 1, term)) {
+        if (p == s) return 3;
+        if (!iswalnum(p[-1])) best = 2;
+        else if (!best) best = 1;
+    }
+    return best;
+}
+
+// Puts the user's own text back in the address bar, along with the completion offered
+// for it. The caret stays where the typing stopped.
+static void ShowUserText(BrowserWindow* win) {
+    SetUrlBoxText(win, win->userText + win->inlineText);
+    size_t typed = win->userText.size();
+    SendMessageW(win->editUrl, EM_SETSEL, (WPARAM)(typed + win->inlineText.size()), (LPARAM)typed);
+    SendMessageW(win->editUrl, EM_SCROLLCARET, 0, 0);
+}
+
+// Rebuilds the list for win->userText. `complete` allows the best address to be
+// filled in after the caret; a deletion or a paste leaves the text as it stands.
+static void UpdateSuggestions(BrowserWindow* win, bool complete) {
+    EnsureSuggestListbox(win);
+    win->suggestions.clear();
+    win->inlineText.clear();
+    SendMessageW(win->suggest, LB_RESETCONTENT, 0, 0);
+    const std::wstring q = TrimSpaces(win->userText);
+    if (q.empty()) { HideSuggestions(win); return; }
+    if (q.size() != win->userText.size()) complete = false; // nothing can follow a typed space
+
+    // The words that can match anywhere in an address or a title.
+    std::vector<std::wstring> terms;
+    const std::wstring loose = q.substr(SpanOf(q).bare);
+    for (size_t b = 0; b < loose.size();) {
+        size_t e = min(loose.find_first_of(L" \t", b), loose.size());
+        if (e > b) terms.push_back(loose.substr(b, e - b));
+        b = e + 1;
+    }
+
+    const __int64 now = _time64(nullptr);
+    Suggestion top;                     // the best address that begins with q, if any does
+    std::vector<Suggestion> hosts, rows;
+    for (const HistoryEntry& h : g_history) {
+        const UrlSpan sp = SpanOf(h.url);
+        std::wstring query;
+        const bool searched = SearchPageQuery(h.url, sp, query);
+        const double worth = Frecency(h, now);
+
+        // Does it begin with q? Its scheme and "www." may be left out, and only count
+        // as typed once the typing has gone past them.
+        const size_t starts[] = { sp.bare, sp.www, 0 };
+        for (size_t from : starts) {
+            if (q.size() <= sp.bare - from || StrCmpNIW(h.url.c_str() + from, q.c_str(), (int)q.size()) != 0) continue;
+            if (sp.web && from + q.size() <= sp.hostEnd) {
+                // Still inside the site's name: the site is what's offered, and every
+                // page visited on it speaks for it.
+                const std::wstring text = h.url.substr(from, sp.hostEnd - from);
+                auto it = std::find_if(hosts.begin(), hosts.end(), [&](const Suggestion& s) { return _wcsicmp(s.text.c_str(), text.c_str()) == 0; });
+                if (it == hosts.end()) { hosts.push_back({ text, L"", h.url.substr(0, sp.hostEnd) + L"/" }); it = hosts.end() - 1; }
+                it->score += worth;
+                if (h.url.size() <= sp.hostEnd + 1) { it->url = h.url; it->title = h.title; } // its front page itself
+            }
+            else if (!searched) {
+                // An address typed out in full is the one that was meant, whatever longer ones begin with it.
+                const double score = h.url.size() - from == q.size() ? 1e9 : worth;
+                if (score > top.score) top = { h.url.substr(from), h.title, h.url, false, score };
+            }
+            break;
+        }
+
+        // Or do all the typed words turn up somewhere in it? A results page that names
+        // no search, such as an image lookup, has nothing to offer.
+        if (terms.empty() || (searched && query.empty())) continue;
+        const std::wstring shown = searched ? query : ShownUrl(h.url, sp);
+        int fit = 0;
+        for (const std::wstring& t : terms) {
+            int w = MatchWeight(shown.c_str(), t.c_str());
+            if (!searched) { int tw = MatchWeight(h.title.c_str(), t.c_str()); if (tw > w) w = tw; }
+            if (!w) { fit = 0; break; }
+            fit += w;
+        }
+        if (!fit) continue;
+        if (searched) rows.push_back({ query, L"", BuildGoogleQuery(query), true, worth * fit / terms.size() });
+        else rows.push_back({ shown, h.title, h.url, false, worth * fit / terms.size() });
+    }
+    for (const Suggestion& s : hosts) if (top.url.empty() || s.score > top.score) top = s;
+    std::stable_sort(rows.begin(), rows.end(), [](const Suggestion& a, const Suggestion& b) { return a.score > b.score; });
+
+    Suggestion own; // the text as typed
+    own.text = q;
+    own.url = UrlForInput(q, &own.search);
+
+    // An address is only filled in on some evidence that it is wanted: typed in once
+    // before, or a couple of recent visits. One followed link doesn't change what Enter does.
+    const bool found = !top.url.empty(), whole = found && top.text.size() <= q.size();
+    if (found && (whole || (complete && top.score >= kCompleteMinWorth))) {
+        win->suggestions.push_back(top);
+        if (!whole) win->inlineText = top.text.substr(q.size());
+        if (!whole || own.search) win->suggestions.push_back(own);
+    }
+    else {
+        win->suggestions.push_back(own);
+        if (found) win->suggestions.push_back(top);
+    }
+    for (const Suggestion& r : rows) {
+        if ((int)win->suggestions.size() >= kMaxSuggestions) break;
+        bool listed = std::any_of(win->suggestions.begin(), win->suggestions.end(), [&](const Suggestion& s) {
+            return _wcsicmp(s.url.c_str(), r.url.c_str()) == 0 || (s.search == r.search && _wcsicmp(s.text.c_str(), r.text.c_str()) == 0);
+            });
+        if (!listed) win->suggestions.push_back(r);
+    }
+
+    for (size_t i = 0; i < win->suggestions.size(); ++i) SendMessageW(win->suggest, LB_ADDSTRING, 0, (LPARAM)i);
+    SendMessageW(win->suggest, LB_SETCURSEL, 0, 0);
+    PositionSuggestBelowEdit(win, (int)win->suggestions.size());
+    win->suggestVisible = true;
+    if (!win->inlineText.empty()) ShowUserText(win);
+}
+
+// The address bar's text was changed by the user.
+static void OnUrlEdited(BrowserWindow* win) {
+    win->editDirty = true;
+    win->userText = UrlBoxText(win);
+    // A completion only follows a character typed at the end of the text.
+    DWORD from = 0, to = 0;
+    SendMessageW(win->editUrl, EM_GETSEL, (WPARAM)&from, (LPARAM)&to);
+    UpdateSuggestions(win, win->typingChar && from == win->userText.size() && to == from);
+}
+
+// Up and Down go round the list, showing each row in the address bar on the way.
+static void MoveSuggestSelection(BrowserWindow* win, int delta) {
+    int count = (int)win->suggestions.size();
+    if (!win->suggestVisible || count <= 0) return;
+    int sel = (int)SendMessageW(win->suggest, LB_GETCURSEL, 0, 0);
+    sel = ((sel < 0 ? 0 : sel) + delta + count) % count;
+    SendMessageW(win->suggest, LB_SETCURSEL, sel, 0);
+    if (sel == 0) { ShowUserText(win); return; }
+    SetUrlBoxText(win, win->suggestions[sel].text);
     int len = GetWindowTextLengthW(win->editUrl);
     SendMessageW(win->editUrl, EM_SETSEL, len, len);
     SendMessageW(win->editUrl, EM_SCROLLCARET, 0, 0);
-    win->editDirty = true; // it is the user's text now; page events must not replace it
+}
+
+// Once the caret is moved into text the list put in the box, a completion or a row
+// being tried out, that text is the user's own, as if it had been typed.
+static void AdoptShownText(BrowserWindow* win) {
+    if (!win->suggestVisible) return;
+    std::wstring text = UrlBoxText(win);
+    if (text == win->userText) return;
+    DWORD from = 0, to = 0;
+    SendMessageW(win->editUrl, EM_GETSEL, (WPARAM)&from, (LPARAM)&to);
+    bool onTop = SendMessageW(win->suggest, LB_GETCURSEL, 0, 0) <= 0;
+    if (onTop && from == win->userText.size() && to == text.size()) return; // the completion is still only an offer
+    win->userText = text;
+    UpdateSuggestions(win, false);
+}
+
+// Escape backs out one step at a time: from a row being tried out to the typed text,
+// then out of the list and its completion, then back to the page's own address.
+static void EscapeAddressBar(BrowserWindow* win) {
+    if (win->suggestVisible) {
+        bool tryingRow = SendMessageW(win->suggest, LB_GETCURSEL, 0, 0) > 0;
+        bool completed = !win->inlineText.empty();
+        if (tryingRow) SendMessageW(win->suggest, LB_SETCURSEL, 0, 0);
+        else HideSuggestions(win);
+        if (tryingRow || completed) ShowUserText(win);
+        return;
+    }
+    win->editDirty = false;
+    UpdateUrlBox(win);
+    SendMessageW(win->editUrl, EM_SETSEL, 0, -1);
 }
 
 static LRESULT CALLBACK SuggestSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR)
@@ -571,65 +911,17 @@ static LRESULT CALLBACK SuggestSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
     BrowserWindow* win = WinFromChild(h);
     switch (m)
     {
-    case WM_GETDLGCODE:
-        return DLGC_WANTALLKEYS | DLGC_WANTCHARS;
-
-    case WM_CHAR:
+    // The list never takes the keyboard from the address bar, which a list box does
+    // when left to handle a click itself. A click picks the row under it and goes there.
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+    case WM_LBUTTONUP:
     {
-        wchar_t ch = static_cast<wchar_t>(w);
-
-        if (ch == L'\r') {
-            if (win) CommitSuggestion(win, true);
-            return 0;
-        }
-        // Escape was handled on WM_KEYDOWN; the rest are leftovers of Ctrl shortcuts.
-        if (ch < 0x20 && ch != L'\b')
-            return 0;
-
-        // Typing, or Backspace, carries on from the picked suggestion in the address bar.
-        if (win && win->editUrl) {
-            EditPickedSuggestion(win);
-            SendMessageW(win->editUrl, WM_CHAR, w, l);
-        }
+        LRESULT hit = SendMessageW(h, LB_ITEMFROMPOINT, 0, l);
+        if (!win || HIWORD(hit)) return 0;
+        SendMessageW(h, LB_SETCURSEL, LOWORD(hit), 0);
+        if (m == WM_LBUTTONUP) NavigateFromUrlBox(win);
         return 0;
-    }
-
-    case WM_KEYDOWN:
-    {
-        int count = (int)SendMessageW(h, LB_GETCOUNT, 0, 0);
-        int sel = (int)SendMessageW(h, LB_GETCURSEL, 0, 0);
-        if (count <= 0)
-            break;
-
-        if (w == VK_RETURN) {
-            if (win) CommitSuggestion(win, true);
-            return 0;
-        }
-        if (w == VK_ESCAPE) {
-            if (win) EditPickedSuggestion(win);
-            return 0;
-        }
-        if (w == VK_UP) {
-            if (sel <= 0) {
-                if (win && win->editUrl) {
-                    SetFocus(win->editUrl);
-                    SendMessageW(win->editUrl, EM_SETSEL, 0, -1);
-                }
-                return 0;
-            }
-            SendMessageW(h, LB_SETCURSEL, sel - 1, 0);
-            if (win) ApplySuggestSelectionToEdit(win);
-            return 0;
-        }
-        if (w == VK_DOWN) {
-            int next = (sel == LB_ERR) ? 0 : sel + 1;
-            if (next >= count)
-                next = count - 1;
-            SendMessageW(h, LB_SETCURSEL, next, 0);
-            if (win) ApplySuggestSelectionToEdit(win);
-            return 0;
-        }
-        break;
     }
     }
 
@@ -637,29 +929,34 @@ static LRESULT CALLBACK SuggestSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
 }
 
 // ---------- navigation ----------
-static void NavigateFromUrlBox(BrowserWindow* win) {
-    if (win->active < 0 || win->active >= (int)win->tabs.size()) return;
-    wchar_t raw[2048] = L""; GetWindowTextW(win->editUrl, raw, ARRAYSIZE(raw));
-    std::wstring input = raw;
-    auto trim = [](std::wstring& s) {
-        auto notsp = [](wchar_t c) { return c != L' ' && c != L'\t' && c != L'\r' && c != L'\n'; };
-        while (!s.empty() && !notsp(s.front())) s.erase(s.begin());
-        while (!s.empty() && !notsp(s.back()))  s.pop_back();
-        };
-    trim(input);
-    if (input.empty()) return;
-    std::wstring urlToGo;
-    if (PathIsURLW(input.c_str())) urlToGo = input;
-    else if (LooksLikeDomain(input)) urlToGo = L"https://" + input;
-    else urlToGo = BuildGoogleQuery(input);
-
+// `typed` says the address itself was asked for, which counts toward suggesting it.
+static void NavigateTo(BrowserWindow* win, const std::wstring& url, bool typed) {
+    Tab& tab = win->tabs[win->active];
     win->editDirty = false;
     HideSuggestions(win);
-    if (win->tabs[win->active].web) win->tabs[win->active].web->Navigate(urlToGo.c_str());
+    SetUrlBoxText(win, url);
+    tab.typedNav = typed;
+    if (tab.web) tab.web->Navigate(url.c_str());
     else {
-        win->tabs[win->active].pendingUri = urlToGo;
+        tab.pendingUri = url;
         PostMessage(win->client, WM_APP_INIT_WEBVIEW, 0, 0);
     }
+}
+static void NavigateFromUrlBox(BrowserWindow* win) {
+    if (win->active < 0 || win->active >= (int)win->tabs.size()) return;
+    // With the list open it goes to the selected row. The top one stands for the text
+    // in the box, so plain Enter takes whatever was completed.
+    int sel = win->suggestVisible ? (int)SendMessageW(win->suggest, LB_GETCURSEL, 0, 0) : -1;
+    if (sel >= 0 && sel < (int)win->suggestions.size()) {
+        const Suggestion picked = win->suggestions[sel];
+        NavigateTo(win, picked.url, !picked.search);
+        return;
+    }
+    std::wstring input = TrimSpaces(UrlBoxText(win));
+    if (input.empty()) return;
+    bool isSearch = false;
+    std::wstring urlToGo = UrlForInput(input, &isSearch);
+    NavigateTo(win, urlToGo, !isSearch);
 }
 
 // ---------- edit subclass ----------
@@ -701,13 +998,18 @@ static LRESULT CALLBACK EditSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR
         if (HandleGlobalShortcut(win, (WPARAM)w, ctrl, shift, alt)) return 0;
         if (win && ctrl && w == 'L') { FocusAddressBar(win); win->editDirty = true; return 0; }
         if (win && h == win->editUrl && ctrl && !alt && w == 'A') { SendMessageW(h, EM_SETSEL, 0, -1); return 0; }
-        if (win && w == VK_DOWN && win->suggestVisible) {
-            SetFocus(win->suggest);
-            SendMessageW(win->suggest, LB_SETCURSEL, 0, 0);
-            ApplySuggestSelectionToEdit(win);
-            return 0;
+        if (win && h == win->editUrl) {
+            if (win->suggestVisible && (w == VK_DOWN || w == VK_UP || w == VK_TAB)) {
+                MoveSuggestSelection(win, (w == VK_UP || (w == VK_TAB && shift)) ? -1 : 1);
+                return 0;
+            }
+            if (w == VK_ESCAPE) { EscapeAddressBar(win); return 0; }
+            if (w == VK_LEFT || w == VK_RIGHT || w == VK_HOME || w == VK_END) {
+                LRESULT r = DefSubclassProc(h, m, w, l);
+                AdoptShownText(win);
+                return r;
+            }
         }
-        if (win && w == VK_ESCAPE && win->suggestVisible) { HideSuggestions(win); return 0; }
         if (win && w == VK_RETURN) { win->editDirty = false; NavigateFromUrlBox(win); return 0; }
         break;
     }
@@ -719,10 +1021,23 @@ static LRESULT CALLBACK EditSubproc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR
         // the character rather than the Ctrl key keeps AltGr-typed characters working.
         if ((w < 0x20 || w == 0x7F) && w != 0x03 && w != 0x16 && w != 0x18 && w != 0x1A && w != L'\b')
             return 0;
+        // Only a character that was typed brings a completion with it, which the
+        // edit's change notice has no way to tell from Backspace or a paste.
+        if (win && h == win->editUrl && w >= 0x20) {
+            win->typingChar = true;
+            LRESULT r = DefSubclassProc(h, m, w, l);
+            win->typingChar = false;
+            return r;
+        }
         break;
 
     case WM_LBUTTONDOWN:
-        if (win && h == win->editUrl && GetFocus() != h) win->urlClickSelect = true;
+        if (win && h == win->editUrl) {
+            if (GetFocus() != h) win->urlClickSelect = true;
+            LRESULT r = DefSubclassProc(h, m, w, l);
+            AdoptShownText(win);
+            return r;
+        }
         break;
 
     case WM_LBUTTONUP:
@@ -1263,6 +1578,44 @@ static LRESULT CALLBACK FullscreenProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// ---------- zoom ----------
+// Zoom belongs to the site, as it does in Chrome. Zooming a page with Ctrl and the
+// wheel, + or - sets it for the page's host: every tab on that host follows, and it
+// comes back whenever the host is visited again. Ctrl+0 puts the site back to normal.
+static std::wstring TabHost(const Tab& t) {
+    LPWSTR src = nullptr; std::wstring url;
+    if (t.web && SUCCEEDED(t.web->get_Source(&src)) && src) { url = src; CoTaskMemFree(src); }
+    UrlSpan sp = SpanOf(url);
+    std::wstring host = sp.web ? url.substr(sp.www, sp.hostEnd - sp.www) : L"";
+    for (auto& c : host) c = (wchar_t)towlower(c);
+    return host;
+}
+// A factor set here is the webview's own from then on, kept from page to page. One the
+// user sets lasts only until the next page loads, which is why theirs is set again here.
+static void SetTabZoom(Tab& t, double factor) {
+    t.zoom = factor;
+    if (t.ctl) t.ctl->put_ZoomFactor(factor);
+}
+// The page in t has changed: it is shown at the zoom of the site it is on now.
+static void ApplySiteZoom(Tab& t) {
+    auto it = g_zoom.find(TabHost(t));
+    double factor = it == g_zoom.end() ? 1.0 : it->second;
+    if (fabs(factor - t.zoom) > 0.001) SetTabZoom(t, factor);
+}
+// The user zoomed the page in t.
+static void SetSiteZoom(Tab& t, double factor) {
+    const std::wstring host = TabHost(t);
+    if (host.empty()) { SetTabZoom(t, factor); return; } // a local file or the like: this tab only
+    if (fabs(factor - 1.0) < 0.001) g_zoom.erase(host); else g_zoom[host] = factor;
+    SaveZoom();
+    for (auto& w : g_windows)
+        for (Tab& other : w->tabs)
+            if (other.web && TabHost(other) == host) SetTabZoom(other, factor);
+}
+static void ResetSiteZoom(BrowserWindow* win) {
+    if (win->active >= 0 && win->active < (int)win->tabs.size()) SetSiteZoom(win->tabs[win->active], 1.0);
+}
+
 // Handlers look the tab's window up by id on every event instead of capturing it,
 // so they keep working after the tab is dragged to another window.
 static void WireTabEvents(BrowserWindow* owner, int tabId) {
@@ -1279,6 +1632,11 @@ static void WireTabEvents(BrowserWindow* owner, int tabId) {
             LPWSTR t = nullptr;
             if (s && SUCCEEDED(s->get_DocumentTitle(&t))) {
                 UpdateTabTitle(win, i, t);
+                LPWSTR src = nullptr;
+                if (t && SUCCEEDED(s->get_Source(&src)) && src) {
+                    if (HistoryEntry* h = FindInHistory(src)) SetHistoryTitle(*h, t);
+                    CoTaskMemFree(src);
+                }
                 if (t) CoTaskMemFree(t);
             }
             return S_OK;
@@ -1296,9 +1654,7 @@ static void WireTabEvents(BrowserWindow* owner, int tabId) {
             LPWSTR uri = nullptr;
             if (SUCCEEDED(a->get_Uri(&uri))) {
                 if (i == win->active && !(GetFocus() == win->editUrl && win->editDirty)) {
-                    win->settingUrl = true;
-                    SetWindowTextW(win->editUrl, uri ? uri : L"");
-                    win->settingUrl = false;
+                    ShowPageUrl(win, uri);
                 }
                 if (uri) CoTaskMemFree(uri);
             }
@@ -1309,33 +1665,42 @@ static void WireTabEvents(BrowserWindow* owner, int tabId) {
         [tabId](ICoreWebView2* s, ICoreWebView2SourceChangedEventArgs*)->HRESULT {
             BrowserWindow* win = WinFromTabId(tabId);
             if (!s || !win) return S_OK;
-            int i = TabIndexById(win, tabId); if (i < 0 || i != win->active) return S_OK;
+            int i = TabIndexById(win, tabId); if (i < 0) return S_OK;
+            ApplySiteZoom(win->tabs[i]);
+            if (i != win->active) return S_OK;
             if (GetFocus() == win->editUrl && win->editDirty) return S_OK;
 
             LPWSTR src = nullptr;
             if (SUCCEEDED(s->get_Source(&src))) {
-                win->settingUrl = true;
-                SetWindowTextW(win->editUrl, src ? src : L"");
-                win->settingUrl = false;
+                ShowPageUrl(win, src);
                 if (src) CoTaskMemFree(src);
             }
             return S_OK;
         }).Get(), nullptr);
 
     web->add_NavigationCompleted(Microsoft::WRL::Callback<ICoreWebView2NavigationCompletedEventHandler>(
-        [tabId](ICoreWebView2* s, ICoreWebView2NavigationCompletedEventArgs*)->HRESULT {
+        [tabId](ICoreWebView2* s, ICoreWebView2NavigationCompletedEventArgs* a)->HRESULT {
             BrowserWindow* win = WinFromTabId(tabId); if (!win) return S_OK;
             int i = TabIndexById(win, tabId); if (i < 0) return S_OK;
+            const bool typed = win->tabs[i].typedNav;
+            win->tabs[i].typedNav = false;
             if (s) {
                 LPWSTR src = nullptr;
                 if (SUCCEEDED(s->get_Source(&src))) {
                     std::wstring url = src ? src : L"";
                     win->tabs[i].lastUri = url;
-                    AddToHistory(url);
+                    // A load that failed is left out, or a mistyped address would be
+                    // suggested from then on.
+                    BOOL ok = TRUE;
+                    if (a) a->get_IsSuccess(&ok);
+                    if (ok) {
+                        LPWSTR title = nullptr;
+                        s->get_DocumentTitle(&title);
+                        AddToHistory(url, title, typed);
+                        if (title) CoTaskMemFree(title);
+                    }
                     if (i == win->active && !(GetFocus() == win->editUrl && win->editDirty)) {
-                        win->settingUrl = true;
-                        SetWindowTextW(win->editUrl, url.c_str());
-                        win->settingUrl = false;
+                        ShowPageUrl(win, url.c_str());
                     }
                     if (src) CoTaskMemFree(src);
                 }
@@ -1429,6 +1794,17 @@ static void WireTabEvents(BrowserWindow* owner, int tabId) {
                 return S_OK;
             }).Get(), nullptr);
     }
+
+    owner->tabs[idx].ctl->add_ZoomFactorChanged(Microsoft::WRL::Callback<ICoreWebView2ZoomFactorChangedEventHandler>(
+        [tabId](ICoreWebView2Controller* c, IUnknown*)->HRESULT {
+            BrowserWindow* win = WinFromTabId(tabId);
+            int i = win ? TabIndexById(win, tabId) : -1;
+            double factor = 1.0;
+            if (i < 0 || !c || FAILED(c->get_ZoomFactor(&factor))) return S_OK;
+            // Any factor but the one this tab was given is the user's doing.
+            if (fabs(factor - win->tabs[i].zoom) > 0.001) SetSiteZoom(win->tabs[i], factor);
+            return S_OK;
+        }).Get(), nullptr);
 
     owner->tabs[idx].ctl->add_AcceleratorKeyPressed(Microsoft::WRL::Callback<ICoreWebView2AcceleratorKeyPressedEventHandler>(
         [tabId](ICoreWebView2Controller*, ICoreWebView2AcceleratorKeyPressedEventArgs* args)->HRESULT {
@@ -1587,7 +1963,8 @@ static void CreateWebViewForTab(BrowserWindow* owner, int tabId) {
 
                     if (i == win->active) {
                         LayoutActiveWebView(win);
-                        if (win->tabs[i].ctl) win->tabs[i].ctl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                        // A tab opened to type an address into keeps the keyboard there.
+                        if (win->tabs[i].ctl && GetFocus() != win->editUrl) win->tabs[i].ctl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
                     }
                     return S_OK;
                 }).Get());
@@ -1626,7 +2003,7 @@ static LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     case WM_DRAWITEM: {
         const DRAWITEMSTRUCT* dis = (const DRAWITEMSTRUCT*)lParam;
         if (!dis) break;
-        if (dis->CtlID == IDC_SUGGEST) return FALSE;
+        if (dis->CtlID == IDC_SUGGEST) { DrawSuggestion(self, dis); return TRUE; }
 
         bool isTab = false, isActive = false;
         HICON hIcon = nullptr;
@@ -1673,19 +2050,14 @@ static LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         int id = LOWORD(wParam), code = HIWORD(wParam);
         if (id == IDC_URL) {
             if (code == EN_CHANGE) {
-                if (!self->settingUrl && GetFocus() == self->editUrl) { self->editDirty = true; wchar_t q[2048] = L""; GetWindowTextW(self->editUrl, q, 2048); PopulateSuggestions(self, q); }
+                if (!self->settingUrl && GetFocus() == self->editUrl) OnUrlEdited(self);
                 return 0;
             }
             if (code == EN_KILLFOCUS) {
                 self->editDirty = false;
-                if (GetFocus() != self->suggest) HideSuggestions(self);
+                HideSuggestions(self);
                 return 0;
             }
-        }
-        if (id == IDC_SUGGEST) {
-            if (code == LBN_SELCHANGE) { ApplySuggestSelectionToEdit(self); return 0; }
-            if (code == LBN_DBLCLK) { CommitSuggestion(self, true); return 0; }
-            if (code == LBN_KILLFOCUS) { if (GetFocus() != self->editUrl) HideSuggestions(self); return 0; }
         }
         if (code == BN_CLICKED) {
             if (id == IDC_BACK) {
@@ -1709,6 +2081,7 @@ static LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             }
             if (id == IDC_NEW_TAB) {
                 NewTab(self);
+                FocusAddressBar(self);
                 return 0;
             }
         }

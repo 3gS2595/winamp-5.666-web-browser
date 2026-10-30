@@ -2,82 +2,74 @@
 // startup whenever the splash screen is enabled (winamp.ini, [Winamp] splash=1).
 
 #include <windows.h>
+
 #include <mmsystem.h>
-#include <shlwapi.h>
+
+#include <gen.h>
+#include <wa_ipc.h>
+
+#include <filesystem>
 #include <string>
+#include <system_error>
 
-#include "gen.h"
-#include "wa_ipc.h"
+namespace {
 
-#pragma comment(lib, "winmm.lib")
-#pragma comment(lib, "shlwapi.lib")
+constexpr wchar_t kMciAlias[] = L"genllama";
 
-static const wchar_t* kMciAlias = L"genllama";
+int __cdecl Init();
+void __cdecl Config();
+void __cdecl Quit();
 
-static int __cdecl Init();
-static void __cdecl Config();
-static void __cdecl Quit();
-
-static winampGeneralPurposePlugin plugin = {
-    GPPHDR_VER,
-    (char*)"Llama Whip Splash Sound v1.0",
-    Init,
-    Config,
-    Quit,
-    nullptr,
-    nullptr,
+char g_description[] = "Llama Whip Splash Sound v1.0";
+winampGeneralPurposePlugin g_plugin{
+    .version = GPPHDR_VER,
+    .description = g_description,
+    .init = Init,
+    .config = Config,
+    .quit = Quit,
 };
 
-// Looks up winamp.ini's full path via IPC and returns the directory it lives
-// in (demo.mp3 ships alongside it), or an empty string if unavailable.
-static std::wstring GetWinampDir()
-{
-    wchar_t iniPath[MAX_PATH] = {0};
-    LRESULT p = SendMessageW(plugin.hwndParent, WM_WA_IPC, 0, IPC_GETINIFILEW);
-    if (!p) return L"";
-    lstrcpynW(iniPath, (wchar_t*)p, MAX_PATH);
-    PathRemoveFileSpecW(iniPath);
-    return iniPath;
+bool g_soundOpen = false;
+
+// Says whether MCI took the command.
+bool SendMci(const std::wstring& command) {
+    return ::mciSendStringW(command.c_str(), nullptr, 0, nullptr) == 0;
 }
 
-static int __cdecl Init()
-{
-    std::wstring dir = GetWinampDir();
-    if (dir.empty()) return GEN_INIT_SUCCESS;
+// winamp.ini, as Winamp names it. Empty if it won't say.
+std::filesystem::path WinampIniFile() {
+    const auto* path =
+        reinterpret_cast<const wchar_t*>(::SendMessageW(g_plugin.hwndParent, WM_WA_IPC, 0, IPC_GETINIFILEW));
+    return path ? std::filesystem::path(path) : std::filesystem::path();
+}
 
-    int splashEnabled = GetPrivateProfileIntW(L"Winamp", L"splash", 1, (dir + L"\\winamp.ini").c_str());
-    if (!splashEnabled) return GEN_INIT_SUCCESS;
+int __cdecl Init() {
+    const std::filesystem::path ini = WinampIniFile();
+    if (ini.empty()) return GEN_INIT_SUCCESS;
+    if (!::GetPrivateProfileIntW(L"Winamp", L"splash", 1, ini.c_str())) return GEN_INIT_SUCCESS;
 
-    std::wstring mp3Path = dir + L"\\demo.mp3";
-    if (GetFileAttributesW(mp3Path.c_str()) == INVALID_FILE_ATTRIBUTES)
-        return GEN_INIT_SUCCESS;
+    // demo.mp3 ships alongside winamp.ini.
+    const std::filesystem::path sound = ini.parent_path() / L"demo.mp3";
+    std::error_code error;
+    if (!std::filesystem::exists(sound, error)) return GEN_INIT_SUCCESS;
 
-    wchar_t cmd[MAX_PATH + 64];
-    wsprintfW(cmd, L"open \"%s\" type mpegvideo alias %s", mp3Path.c_str(), kMciAlias);
-    if (mciSendStringW(cmd, nullptr, 0, nullptr) == 0)
-    {
-        wchar_t playCmd[64];
-        wsprintfW(playCmd, L"play %s", kMciAlias);
-        mciSendStringW(playCmd, nullptr, 0, nullptr);
-    }
-
+    g_soundOpen = SendMci(L"open \"" + sound.wstring() + L"\" type mpegvideo alias " + kMciAlias);
+    if (g_soundOpen) SendMci(std::wstring(L"play ") + kMciAlias);
     return GEN_INIT_SUCCESS;
 }
 
-static void __cdecl Config()
-{
+void __cdecl Config() {
     // No settings to configure - behavior is entirely driven by Winamp's
     // own splash screen preference.
 }
 
-static void __cdecl Quit()
-{
-    wchar_t closeCmd[64];
-    wsprintfW(closeCmd, L"close %s", kMciAlias);
-    mciSendStringW(closeCmd, nullptr, 0, nullptr);
+void __cdecl Quit() {
+    if (g_soundOpen) SendMci(std::wstring(L"close ") + kMciAlias);
+    g_soundOpen = false;
 }
 
-extern "C" __declspec(dllexport) winampGeneralPurposePlugin* __cdecl winampGetGeneralPurposePlugin()
-{
-    return &plugin;
+} // namespace
+
+extern "C" __declspec(dllexport) winampGeneralPurposePlugin* __cdecl winampGetGeneralPurposePlugin() {
+    return &g_plugin;
 }

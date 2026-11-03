@@ -1,0 +1,19 @@
+# The style the sources are written in. Run clang-format (it ships with Visual
+# Studio) before committing: clang-format -i exodium/src/* tests/*.cpp tests/*.h gen_llama/*.cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 120
+AccessModifierOffset: -4
+PointerAlignment: Left
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortLoopsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Empty
+AlwaysBreakTemplateDeclarations: Yes
+BreakBeforeBinaryOperators: None
+SpacesBeforeTrailingComments: 1
+InsertNewlineAtEOF: true
+# Vendor headers from the Winamp SDK are left exactly as they came.
+IncludeBlocks: Preserve
+SortIncludes: CaseSensitive

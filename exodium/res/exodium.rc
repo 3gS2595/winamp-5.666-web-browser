@@ -1,0 +1,7 @@
+// Resources built into gen_browser.dll.
+#include "resource.h"
+
+// The ironwork on a browser window's corners (src\ornament.cpp): the piece with the
+// buttons for the top right one, and the same piece without them for the others.
+IDR_CORNER_ORNAMENT RCDATA "corner_ornament.png"
+IDR_CORNER_ORNAMENT_PLAIN RCDATA "corner_ornament_plain.png"

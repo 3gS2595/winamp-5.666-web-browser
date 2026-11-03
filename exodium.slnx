@@ -4,4 +4,6 @@
     <Platform Name="x86" />
   </Configurations>
   <Project Path="exodium/exodium.vcxproj" Id="456602a5-f475-40a0-98aa-331475f0786e" />
+  <Project Path="gen_llama/gen_llama.vcxproj" Id="8c1e6f2a-0c2b-4a8e-9d3f-7b6a5e4d3c2b" />
+  <Project Path="tests/exodium_tests.vcxproj" Id="3b7d2c4e-5a1f-4e6b-9c8d-2f1a0b9e8d7c" />
 </Solution>

@@ -57,6 +57,42 @@ TEST_CASE(TypedTextLeadsSomewhere) {
     EXPECT(!history.isSearch);
 }
 
+TEST_CASE(OutsideLinksLeadToPages) {
+    const auto resolved = [](std::wstring_view link) { return ResolveOutsideLink(link).value_or(L"(refused)"); };
+
+    EXPECT_EQ(resolved(L"https://example.com/a?b=c#d"), L"https://example.com/a?b=c#d");
+    EXPECT_EQ(resolved(L"HTTP://example.com"), L"HTTP://example.com");
+    EXPECT_EQ(resolved(L"file:///C:/page.html"), L"file:///C:/page.html");
+
+    // A file type Windows sends here comes as a path.
+    EXPECT_EQ(resolved(LR"(C:\Pages\page.html)"), L"file:///C:/Pages/page.html");
+    EXPECT_EQ(resolved(LR"(C:\My Pages\a#b.html)"), L"file:///C:/My%20Pages/a%23b.html");
+    EXPECT_EQ(resolved(LR"(\\server\share\page.html)"), L"file://server/share/page.html");
+
+    EXPECT_EQ(resolved(L""), L"");
+}
+
+TEST_CASE(OutsideLinksThatLeadToNoPageAreRefused) {
+    EXPECT(!ResolveOutsideLink(L"javascript:alert(1)"));
+    EXPECT(!ResolveOutsideLink(L"about:blank"));
+    EXPECT(!ResolveOutsideLink(L"exodium://history"));
+    EXPECT(!ResolveOutsideLink(L"--class=Evil https://example.com/"));
+    EXPECT(!ResolveOutsideLink(L"page.html"));
+}
+
+TEST_CASE(ClaudeCodesWindowsSayWhichSessionTheyBelongTo) {
+    const wchar_t start[] = L"file:///C:/Winamp/Plugins/exodium_start.html";
+    EXPECT_EQ(ToolSessionOf(std::wstring(start) + L"#pid=1234&3f1c-uuid").value_or(0), 1234u);
+    EXPECT_EQ(ToolSessionOf(std::wstring(start) + L"#3f1c-uuid&pid=77").value_or(0), 77u);
+    // The start page of a wrapper from before sessions were named, and anything else.
+    EXPECT(!ToolSessionOf(std::wstring(start) + L"#3f1c-uuid"));
+    EXPECT(!ToolSessionOf(start));
+    EXPECT(!ToolSessionOf(L"https://example.com/#pid=1234"));
+    EXPECT(!ToolSessionOf(std::wstring(start) + L"#pid=12x4"));
+    EXPECT(!ToolSessionOf(std::wstring(start) + L"#pid=0"));
+    EXPECT(!ToolSessionOf(std::wstring(start) + L"#pid="));
+}
+
 TEST_CASE(FindsThePartsOfAnAddress) {
     const UrlSpan full = SpanOf(L"https://www.example.com/path");
     EXPECT(full.web);

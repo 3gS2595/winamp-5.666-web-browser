@@ -1,0 +1,7 @@
+// Resources built into exodium_open.exe.
+#include <winres.h>
+
+#include "resource.h"
+
+// Drawn by tools\make-icon.ps1, at 16, 20, 24, 32, 40, 48, 64 and 256 pixels.
+IDI_EXODIUM ICON "exodium_open.ico"

@@ -135,6 +135,7 @@ void NavigateTo(BrowserWindow& win, const std::wstring& url, bool typed) {
     win.editDirty = false;
     HideSuggestions(win);
     SetUrlBoxText(win, url);
+    NoteTypedNavigation(win);
     tab->typedNav = typed;
     if (tab->webview) {
         tab->webview->Navigate(url.c_str());
@@ -271,6 +272,16 @@ LRESULT CALLBACK ControlProc(HWND control, UINT msg, WPARAM wParam, LPARAM lPara
         }
         break;
 
+    case WM_MBUTTONUP:
+        // The middle button on Back or Forward opens the page it leads to in a new tab, as
+        // Ctrl+click does.
+        if (win && (control == win->backButton || control == win->forwardButton)) {
+            GoBackOrForward(*win, control == win->forwardButton,
+                            WhereClickOpens(true, (wParam & MK_CONTROL) != 0, (wParam & MK_SHIFT) != 0));
+            return 0;
+        }
+        break;
+
     case WM_LBUTTONUP:
         // Clicking into the address bar selects the whole URL, as browsers do, unless
         // that click was itself a drag-select.
@@ -307,7 +318,7 @@ void CreateAddressBar(BrowserWindow& win) {
         return control;
     };
 
-    win.urlEdit = create(0, L"EDIT", kDefaultUrl, WS_VISIBLE | ES_AUTOHSCROLL, kIdUrl);
+    win.urlEdit = create(0, L"EDIT", HomePage().c_str(), WS_VISIBLE | ES_AUTOHSCROLL, kIdUrl);
     SubclassControl(win.urlEdit);
 
     win.suggestList = create(WS_EX_TOOLWINDOW, L"LISTBOX", L"",
@@ -346,8 +357,9 @@ void UpdateUrlBox(BrowserWindow& win) {
     if (IsEditingUrl(win)) return;
     const Tab* tab = ActiveTab(win);
     if (!tab) return;
-    // A tab whose webview isn't up yet shows where it is headed.
-    ShowPageUrl(win, tab->webview ? SourceOf(tab->webview.Get()) : tab->pendingUrl);
+    // A tab whose webview isn't up yet shows where it is headed, as does one still making
+    // the history it was given.
+    ShowPageUrl(win, tab->webview && !tab->copyingHistory ? SourceOf(tab->webview.Get()) : tab->pendingUrl);
 }
 
 void UpdateReloadButton(BrowserWindow& win) {
@@ -364,6 +376,8 @@ void HideSuggestions(BrowserWindow& win) {
 
 void OnUrlEdited(BrowserWindow& win) {
     win.editDirty = true;
+    // The suggestions are coming, in its place; and Escape is to be the address bar's.
+    CloseDownloadsPanel(win);
     win.userText = UrlBoxText(win);
     // A completion only follows a character typed at the end of the text.
     const Selection selection = EditSelection(win.urlEdit);

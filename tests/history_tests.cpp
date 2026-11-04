@@ -43,6 +43,12 @@ TEST_CASE(KeepsOnlyWebAddresses) {
     EXPECT(history.entries().empty());
 }
 
+TEST_CASE(ClaudeCodesStartPageIsNotKept) {
+    History history;
+    history.RecordVisit(L"file:///C:/Winamp/Plugins/exodium_start.html#1234", L"Claude Code", false, kNow);
+    EXPECT(history.entries().empty());
+}
+
 TEST_CASE(TitlesFitOnALine) {
     History history;
     history.RecordVisit(L"https://a.example/", L"one\ttwo\r\nthree", false, kNow);

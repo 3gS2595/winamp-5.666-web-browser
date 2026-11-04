@@ -3,13 +3,15 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
 
 namespace exodium {
 
-// Where a new tab goes when it is given nowhere else to go.
+// The home page until the preferences name another. Where a new tab goes when it is
+// given nowhere else to go is HomePage() (browser.h), which follows them.
 inline constexpr wchar_t kDefaultUrl[] = L"https://google.com/";
 
 // A closed tab's webview is put away on this page, which unloads the one it showed.
@@ -19,6 +21,15 @@ inline constexpr wchar_t kParkedUrl[] = L"about:blank#exodium-closed";
 // an address that leads nowhere on the network. The address bar calls it kHistoryName.
 inline constexpr wchar_t kHistoryUrl[] = L"https://exodium.invalid/history";
 inline constexpr wchar_t kHistoryName[] = L"exodium://history";
+
+// The page Claude Code's windows open on, tools\exodium_start.html, known by its name. It
+// has a new address each time and there is nothing on it to go back to.
+inline constexpr wchar_t kToolStartPage[] = L"exodium_start.html";
+
+// The Claude Code session a window opened on kToolStartPage belongs to: the process id of
+// its browser tools, which they give as "pid=" in the page's fragment, as in
+// exodium_start.html#pid=1234&<uuid>. Nothing for any other address.
+[[nodiscard]] std::optional<std::uint32_t> ToolSessionOf(std::wstring_view url);
 
 // Whether `url` is the kind of address the history keeps: http, https or file.
 [[nodiscard]] bool IsLikelyHttpUrl(std::wstring_view url) noexcept;
@@ -30,7 +41,7 @@ inline constexpr wchar_t kHistoryName[] = L"exodium://history";
 // The reverse. Escapes that aren't valid are left as they stand.
 [[nodiscard]] std::wstring PercentDecode(std::wstring_view text);
 
-// The Google results page for a search.
+// The results page for a search, from the search engine in use (search_engines.h).
 [[nodiscard]] std::wstring BuildSearchUrl(std::wstring_view query);
 
 struct ResolvedInput {
@@ -40,6 +51,12 @@ struct ResolvedInput {
 // Where text entered in the address bar leads: a URL as it stands, a bare domain
 // over https, and anything else to a search for it.
 [[nodiscard]] ResolvedInput ResolveAddressInput(std::wstring_view input);
+
+// Where a link handed to the browser from outside leads: a web or file address as it
+// stands, and the full path of a page on disk as a file address. Windows sends nothing
+// else, so anything else is refused; a script address is not to be run on its say-so.
+// No link stays no link.
+[[nodiscard]] std::optional<std::wstring> ResolveOutsideLink(std::wstring_view link);
 
 // Where the parts of an address begin. A web address is shown and matched from
 // `bare` on: nobody types the scheme or the "www.", so neither should be needed.
@@ -58,9 +75,10 @@ struct UrlSpan {
 // The host of a web address in lower case, "www." included. Empty for anything else.
 [[nodiscard]] std::wstring HostOf(std::wstring_view url);
 
-// The words searched for if `url` is a Google results page: empty when the page names
-// no search, such as an image lookup, and nothing at all for any other address. Past
-// searches are offered as searches, not as the long addresses they left behind.
+// The words searched for if `url` is a results page of any search engine on offer, not
+// only the one in use (see KnownResultsPages): empty when the page names no search, such
+// as an image lookup, and nothing at all for any other address. Past searches are offered
+// as searches, not as the long addresses they left behind.
 [[nodiscard]] std::optional<std::wstring> SearchPageQuery(std::wstring_view url, const UrlSpan& span);
 
 } // namespace exodium

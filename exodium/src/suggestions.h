@@ -27,7 +27,7 @@ struct Suggestion {
     std::wstring text;   // what the address bar shows for it
     std::wstring title;  // the page's title, when one is known
     std::wstring url;    // where it goes
-    bool search = false; // a Google search for text, not a page
+    bool search = false; // a search for text with the engine in use, not a page
     double score = 0;
 };
 

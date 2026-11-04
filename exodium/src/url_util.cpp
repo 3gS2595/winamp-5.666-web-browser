@@ -1,5 +1,6 @@
 #include "url_util.h"
 
+#include "search_engines.h"
 #include "text_util.h"
 
 #include <windows.h>
@@ -18,8 +19,6 @@ constexpr std::wstring_view kHttps = L"https://";
 constexpr std::wstring_view kHttp = L"http://";
 constexpr std::wstring_view kFile = L"file://";
 constexpr std::wstring_view kWww = L"www.";
-constexpr std::wstring_view kSearchUrl = L"https://www.google.com/search?q=";
-constexpr std::wstring_view kSearchPage = L"google.com/search?";
 
 constexpr bool IsUnreserved(char c) noexcept {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.' ||
@@ -80,7 +79,7 @@ std::wstring PercentDecode(std::wstring_view text) {
 }
 
 std::wstring BuildSearchUrl(std::wstring_view query) {
-    return std::wstring(kSearchUrl) + PercentEncode(query);
+    return FillSearchUrl(SearchUrlTemplate(), PercentEncode(query));
 }
 
 ResolvedInput ResolveAddressInput(std::wstring_view input) {
@@ -89,6 +88,33 @@ ResolvedInput ResolveAddressInput(std::wstring_view input) {
     if (::PathIsURLW(text.c_str())) return {std::move(text), false};
     if (LooksLikeDomain(text)) return {std::wstring(kHttps) + text, false};
     return {BuildSearchUrl(text), true};
+}
+
+std::optional<std::wstring> ResolveOutsideLink(std::wstring_view link) {
+    if (link.empty() || IsLikelyHttpUrl(link)) return std::wstring(link);
+
+    const std::wstring path(link);
+    if (::PathIsRelativeW(path.c_str())) return std::nullopt; // a script address reads as a relative path
+    // No more than every character escaped, and the scheme.
+    DWORD size = static_cast<DWORD>(path.size() * 3 + kFile.size() + 2);
+    std::wstring url(size, L'\0');
+    if (FAILED(::UrlCreateFromPathW(path.c_str(), url.data(), &size, 0))) return std::nullopt;
+    url.resize(size);
+    return url;
+}
+
+std::optional<std::uint32_t> ToolSessionOf(std::wstring_view url) {
+    const std::size_t page = url.find(kToolStartPage);
+    if (page == std::wstring_view::npos) return std::nullopt;
+    const std::size_t hash = url.find(L'#', page);
+    if (hash == std::wstring_view::npos) return std::nullopt;
+    for (const std::wstring_view part : SplitWords(url.substr(hash + 1), L"&")) {
+        if (!part.starts_with(L"pid=")) continue;
+        const std::wstring_view digits = part.substr(4);
+        if (digits.empty() || !std::ranges::all_of(digits, [](wchar_t c) { return c >= L'0' && c <= L'9'; })) continue;
+        if (const auto pid = ParseNumber<std::uint32_t>(digits); pid && *pid != 0) return pid;
+    }
+    return std::nullopt;
 }
 
 UrlSpan SpanOf(std::wstring_view url) noexcept {
@@ -113,15 +139,21 @@ std::wstring HostOf(std::wstring_view url) {
 }
 
 std::optional<std::wstring> SearchPageQuery(std::wstring_view url, const UrlSpan& span) {
-    if (!span.web || !StartsWithIgnoreCase(url.substr(span.bare), kSearchPage)) return std::nullopt;
+    if (!span.web) return std::nullopt;
+    const std::wstring_view bare = url.substr(span.bare);
+    const std::span<const ResultsPage> pages = KnownResultsPages();
+    const auto page =
+        std::ranges::find_if(pages, [bare](const ResultsPage& p) { return StartsWithIgnoreCase(bare, p.prefix); });
+    if (page == pages.end()) return std::nullopt;
 
     // Each turn of the loop `at` is on the '?' or '&' that starts a parameter.
-    std::size_t at = span.bare + kSearchPage.size() - 1;
-    while (!url.substr(at + 1).starts_with(L"q=")) {
+    const std::wstring key = page->key + L'=';
+    std::size_t at = span.bare + page->prefix.size() - 1;
+    while (!url.substr(at + 1).starts_with(key)) {
         at = url.find(L'&', at + 1);
         if (at == std::wstring_view::npos) return std::wstring();
     }
-    const std::size_t begin = at + 3;
+    const std::size_t begin = at + 1 + key.size();
     const std::size_t end = std::min(url.find_first_of(L"&#", begin), url.size());
 
     std::wstring words(url.substr(begin, end - begin));

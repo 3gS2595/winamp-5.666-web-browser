@@ -1,7 +1,35 @@
 // Resources built into gen_browser.dll.
+#include <winres.h>
+
 #include "resource.h"
 
 // The ironwork on a browser window's corners (src\ornament.cpp): the piece with the
 // buttons for the top right one, and the same piece without them for the others.
 IDR_CORNER_ORNAMENT RCDATA "corner_ornament.png"
 IDR_CORNER_ORNAMENT_PLAIN RCDATA "corner_ornament_plain.png"
+
+// Exodium's page in Winamp's Preferences (src\settings_page.cpp). Winamp puts it in the
+// space its own pages take, which is this size, and they have the same style and font.
+// The checkboxes go down the Options box 13 units apart, above the note at its foot, which
+// leaves room for two more.
+IDD_PREFS DIALOGEX 0, 0, 272, 246
+STYLE DS_SETFONT | DS_FIXEDSYS | WS_CHILD
+EXSTYLE WS_EX_CONTROLPARENT
+FONT 8, "MS Shell Dlg", 0, 0, 0x1
+BEGIN
+    GROUPBOX        "Exodium",IDC_STATIC,0,0,272,246
+    GROUPBOX        "Home Page",IDC_STATIC,5,11,260,42
+    LTEXT           "New windows and tabs open on this page:",IDC_STATIC,12,22,246,8
+    EDITTEXT        IDC_PREFS_HOME_PAGE,12,33,246,12,ES_AUTOHSCROLL
+    GROUPBOX        "Search",IDC_STATIC,5,57,260,70
+    LTEXT           "Searches typed in the address bar go to:",IDC_STATIC,12,68,246,8
+    COMBOBOX        IDC_PREFS_SEARCH_ENGINE,12,79,120,150,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Its address, with %s where the words go:",IDC_STATIC,12,97,246,8
+    EDITTEXT        IDC_PREFS_SEARCH_URL,12,108,246,12,ES_AUTOHSCROLL
+    GROUPBOX        "Options",IDC_STATIC,5,131,260,110
+    CONTROL         "Show close buttons on tabs",IDC_PREFS_TAB_CLOSE_BUTTONS,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,12,143,246,10
+    CONTROL         "Ctrl+N in Winamp opens a new Exodium window",IDC_PREFS_CTRL_N_IN_WINAMP,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,12,156,246,10
+    CONTROL         "Show Exodium in the Start menu",IDC_PREFS_START_MENU,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,12,169,246,10
+    CONTROL         "Winamp's visualizers show page sound while Winamp is stopped",IDC_PREFS_SOUND_IN_VISUALIZERS,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,12,182,246,10
+    LTEXT           "",IDC_PREFS_START_MENU_NOTE,12,222,246,16
+END

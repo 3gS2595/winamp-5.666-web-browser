@@ -65,21 +65,35 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="src\browser.h" />
+    <ClInclude Include="src\download_status.h" />
     <ClInclude Include="src\embed_frame.h" />
     <ClInclude Include="src\gdiplus_headers.h" />
     <ClInclude Include="src\history.h" />
     <ClInclude Include="src\history_page.h" />
     <ClInclude Include="src\pch.h" />
     <ClInclude Include="src\resource.h" />
+    <ClInclude Include="src\search_engines.h" />
+    <ClInclude Include="src\session_history.h" />
+    <ClInclude Include="src\settings.h" />
     <ClInclude Include="src\site_zoom.h" />
+    <ClInclude Include="src\sound_ipc.h" />
+    <ClInclude Include="src\sound_rule.h" />
     <ClInclude Include="src\suggestions.h" />
+    <ClInclude Include="src\tab_order.h" />
+    <ClInclude Include="src\tab_parts.h" />
     <ClInclude Include="src\text_util.h" />
     <ClInclude Include="src\url_util.h" />
     <ClInclude Include="src\win32_util.h" />
+    <ClInclude Include="src\winamp_keys.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\address_bar.cpp" />
+    <ClCompile Include="src\back_forward.cpp" />
     <ClCompile Include="src\browser_window.cpp" />
+    <ClCompile Include="src\claude_session.cpp" />
+    <ClCompile Include="src\download_status.cpp" />
+    <ClCompile Include="src\downloads.cpp" />
+    <ClCompile Include="src\downloads_panel.cpp" />
     <ClCompile Include="src\drawing.cpp" />
     <ClCompile Include="src\embed_frame.cpp" />
     <ClCompile Include="src\frame.cpp" />
@@ -93,14 +107,25 @@
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="src\plugin.cpp" />
+    <ClCompile Include="src\search_engines.cpp" />
+    <ClCompile Include="src\session_history.cpp" />
+    <ClCompile Include="src\settings.cpp" />
+    <ClCompile Include="src\settings_page.cpp" />
     <ClCompile Include="src\site_zoom.cpp" />
+    <ClCompile Include="src\sound_rule.cpp" />
+    <ClCompile Include="src\start_menu.cpp" />
     <ClCompile Include="src\suggestions.cpp" />
     <ClCompile Include="src\tab_drag.cpp" />
+    <ClCompile Include="src\tab_order.cpp" />
+    <ClCompile Include="src\tab_parts.cpp" />
     <ClCompile Include="src\tabs.cpp" />
     <ClCompile Include="src\text_util.cpp" />
     <ClCompile Include="src\url_util.cpp" />
     <ClCompile Include="src\webview.cpp" />
     <ClCompile Include="src\webview_events.cpp" />
+    <ClCompile Include="src\winamp_key_hook.cpp" />
+    <ClCompile Include="src\winamp_keys.cpp" />
+    <ClCompile Include="src\winamp_sound.cpp" />
     <ClCompile Include="src\zoom.cpp" />
   </ItemGroup>
   <ItemGroup>

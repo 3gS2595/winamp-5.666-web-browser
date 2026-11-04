@@ -28,7 +28,7 @@ void InvalidateTabButton(const Tab& tab, bool erase = false) noexcept {
 
 void OnTitleChanged(int tabId, ICoreWebView2* sender) {
     const TabLocation at = FindTab(tabId);
-    if (!at) return;
+    if (!at || at.tab().copyingHistory) return;
     const auto title = ComString(sender, &ICoreWebView2::get_DocumentTitle);
     if (!title) return;
     UpdateTabTitle(*at.window, at.index, *title);
@@ -55,12 +55,12 @@ void OnNavigationStarting(int tabId, ICoreWebView2NavigationStartingEventArgs* a
     at.tab().loading = true;
     StartTabSpinners(win);
     if (at.isActive()) UpdateReloadButton(win);
-    if (uri && at.isActive() && !IsEditingUrl(win)) ShowPageUrl(win, *uri);
+    if (uri && at.isActive() && !IsEditingUrl(win) && !at.tab().copyingHistory) ShowPageUrl(win, *uri);
 }
 
 void OnSourceChanged(int tabId, ICoreWebView2* sender) {
     const TabLocation at = FindTab(tabId);
-    if (!at || !sender) return;
+    if (!at || !sender || at.tab().copyingHistory) return;
     ApplySiteZoom(at.tab());
     if (!at.isActive() || IsEditingUrl(*at.window)) return;
     if (const auto source = ComString(sender, &ICoreWebView2::get_Source)) ShowPageUrl(*at.window, *source);
@@ -68,7 +68,8 @@ void OnSourceChanged(int tabId, ICoreWebView2* sender) {
 
 void OnNavigationCompleted(int tabId, ICoreWebView2* sender, ICoreWebView2NavigationCompletedEventArgs* args) {
     const TabLocation at = FindTab(tabId);
-    if (!at) return;
+    // A stand-in is no visit, and the tab stays busy until the page it shows has loaded.
+    if (!at || at.tab().copyingHistory) return;
     BrowserWindow& win = *at.window;
     Tab& tab = at.tab();
     UINT64 navigationId = 0;
@@ -108,7 +109,24 @@ void OnNewWindowRequested(int tabId, ICoreWebView2NewWindowRequestedEventArgs* a
         args->put_Handled(TRUE);
         return;
     }
-    OpenRequestedWindow(*at.window, args);
+    OpenRequestedWindow(*at.window, tabId, args);
+}
+
+// The webview shows its context menu itself. All that is wanted of it here is the link
+// it was opened on, if any: see OpensBehind in webview.cpp.
+void OnContextMenuRequested(int tabId, ICoreWebView2ContextMenuRequestedEventArgs* args) {
+    const TabLocation at = FindTab(tabId);
+    if (!at || !args) return;
+    Tab& tab = at.tab();
+    tab.menuLink.clear();
+    ComPtr<ICoreWebView2ContextMenuTarget> target;
+    BOOL hasLink = FALSE;
+    if (FAILED(args->get_ContextMenuTarget(&target)) || !target || FAILED(target->get_HasLinkUri(&hasLink)) ||
+        !hasLink) {
+        return;
+    }
+    tab.menuLink = ComString(target.Get(), &ICoreWebView2ContextMenuTarget::get_LinkUri).value_or(std::wstring());
+    tab.menuLinkAt = ::GetTickCount64();
 }
 
 // A page that closes itself, as a sign-in popup does when it is done, takes its tab
@@ -120,9 +138,16 @@ void OnWindowCloseRequested(int tabId) {
 }
 
 // Requests for kHistoryUrl never reach the network; the page is made here, afresh
-// for every visit, and no other page may show it in a frame.
+// for every visit, and no other page may show it in a frame. A tab copying another's
+// history hears of every page it asks for (see back_forward.cpp), and the history is
+// no other address's to be given.
 void OnHistoryPageRequested(ICoreWebView2WebResourceRequestedEventArgs* args) {
     if (!args || !g_app.environment) return;
+    ComPtr<ICoreWebView2WebResourceRequest> request;
+    if (FAILED(args->get_Request(&request)) ||
+        ComString(request.Get(), &ICoreWebView2WebResourceRequest::get_Uri) != kHistoryUrl) {
+        return;
+    }
     const std::string html = ToUtf8(BuildHistoryPageHtml(g_app.history.entries()));
 
     ComPtr<IStream> body;
@@ -329,6 +354,18 @@ void WireTabEvents(int tabId) {
             nullptr);
     }
 
+    // And the context menu.
+    if (ComPtr<ICoreWebView2_11> webview11; SUCCEEDED(webview->QueryInterface(IID_PPV_ARGS(&webview11)))) {
+        webview11->add_ContextMenuRequested(
+            Callback<ICoreWebView2ContextMenuRequestedEventHandler>(
+                [tabId](ICoreWebView2*, ICoreWebView2ContextMenuRequestedEventArgs* args) -> HRESULT {
+                    OnContextMenuRequested(tabId, args);
+                    return S_OK;
+                })
+                .Get(),
+            nullptr);
+    }
+
     // As did being told when a page starts or stops making sound.
     if (ComPtr<ICoreWebView2_8> webview8; SUCCEEDED(webview->QueryInterface(IID_PPV_ARGS(&webview8)))) {
         webview8->add_IsDocumentPlayingAudioChanged(
@@ -356,6 +393,8 @@ void WireTabEvents(int tabId) {
             })
             .Get(),
         nullptr);
+
+    WireTabDownloads(tabId);
 }
 
 } // namespace exodium

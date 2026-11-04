@@ -44,7 +44,7 @@
   <ItemDefinitionGroup>
     <ClCompile>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <AdditionalIncludeDirectories>$(RepoRoot)exodium\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(RepoRoot)exodium\src;$(RepoRoot)exodium_open;$(RepoRoot)in_exodium;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -55,20 +55,38 @@
     <ClInclude Include="test_framework.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="command_line_tests.cpp" />
+    <ClCompile Include="download_status_tests.cpp" />
     <ClCompile Include="history_tests.cpp" />
+    <ClCompile Include="search_engines_tests.cpp" />
+    <ClCompile Include="session_history_tests.cpp" />
+    <ClCompile Include="settings_tests.cpp" />
+    <ClCompile Include="sound_tests.cpp" />
     <ClCompile Include="suggestions_tests.cpp" />
+    <ClCompile Include="tab_order_tests.cpp" />
+    <ClCompile Include="tab_parts_tests.cpp" />
     <ClCompile Include="test_main.cpp" />
     <ClCompile Include="text_util_tests.cpp" />
     <ClCompile Include="url_util_tests.cpp" />
+    <ClCompile Include="winamp_keys_tests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <!-- The code under test, compiled straight from the plugin's sources. -->
+    <ClCompile Include="..\exodium\src\download_status.cpp" />
     <ClCompile Include="..\exodium\src\history.cpp" />
     <ClCompile Include="..\exodium\src\history_page.cpp" />
+    <ClCompile Include="..\exodium\src\search_engines.cpp" />
+    <ClCompile Include="..\exodium\src\session_history.cpp" />
+    <ClCompile Include="..\exodium\src\settings.cpp" />
     <ClCompile Include="..\exodium\src\site_zoom.cpp" />
+    <ClCompile Include="..\exodium\src\sound_rule.cpp" />
     <ClCompile Include="..\exodium\src\suggestions.cpp" />
+    <ClCompile Include="..\exodium\src\tab_order.cpp" />
+    <ClCompile Include="..\exodium\src\tab_parts.cpp" />
     <ClCompile Include="..\exodium\src\text_util.cpp" />
     <ClCompile Include="..\exodium\src\url_util.cpp" />
+    <ClCompile Include="..\exodium\src\winamp_keys.cpp" />
+    <ClCompile Include="..\exodium_open\command_line.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

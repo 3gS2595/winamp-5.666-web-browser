@@ -15,6 +15,9 @@
     <ClInclude Include="src\browser.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\download_status.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\embed_frame.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -33,10 +36,31 @@
     <ClInclude Include="src\resource.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\search_engines.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\session_history.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\settings.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\site_zoom.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\sound_ipc.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\sound_rule.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\suggestions.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\tab_order.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\tab_parts.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\text_util.h">
@@ -48,12 +72,30 @@
     <ClInclude Include="src\win32_util.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\winamp_keys.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\address_bar.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\back_forward.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\browser_window.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\claude_session.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\download_status.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\downloads.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\downloads_panel.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\drawing.cpp">
@@ -89,13 +131,40 @@
     <ClCompile Include="src\plugin.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\search_engines.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\session_history.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\settings.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\settings_page.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\sound_rule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\winamp_sound.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\site_zoom.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\start_menu.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\suggestions.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\tab_drag.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tab_order.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tab_parts.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\tabs.cpp">
@@ -111,6 +180,12 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\webview_events.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\winamp_key_hook.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\winamp_keys.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\zoom.cpp">

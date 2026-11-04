@@ -63,6 +63,7 @@ void CreateControls(BrowserWindow& win) {
     win.reloadButton = CreateButton(win, kGlyphReload, kIdReload);
     win.closeTabButton = CreateButton(win, L"X", kIdCloseTab);
     CreateAddressBar(win);
+    CreateDownloadsControls(win);
 }
 
 RECT WebViewBounds(const BrowserWindow& win) {
@@ -76,6 +77,8 @@ void LayoutActiveWebView(BrowserWindow& win) {
     if (!tab || !tab->controller) return;
     tab->controller->put_Bounds(WebViewBounds(win));
     tab->controller->put_IsVisible(TRUE);
+    // A webview made or brought into the window since the panel opened is in front of it.
+    RaiseDownloadsPanel(win);
 }
 
 void HideAllWebViews(BrowserWindow& win) {
@@ -109,6 +112,8 @@ TabStripFit FitTabStrip(const BrowserWindow& win) {
     int room = TabStripRight(win) - kNewTabSlot - kMargin - TabStripLeft(win); // up to the new tab button
     TabStripFit fit{.tabWidth = kTabWidth, .shown = count, .scrolls = false};
     if (count > 0) fit.tabWidth = std::max(kTabMinWidth, std::min(kTabWidth, room / count - kTabGap));
+    // They don't grow into the room a tab closed with the mouse leaves: see tab_drag.cpp.
+    if (win.keptTabWidth > 0) fit.tabWidth = std::min(fit.tabWidth, win.keptTabWidth);
     if (count * (kTabMinWidth + kTabGap) > room) {
         room -= 2 * (kTabArrowWidth + kTabArrowGap); // the scroll buttons
         fit.scrolls = true;
@@ -187,7 +192,9 @@ void LayoutToolbarAndTabs(BrowserWindow& win) {
         ::MoveWindow(button, x, y, buttonWidth, height, TRUE);
         x += buttonWidth + kButtonGap;
     }
-    ::MoveWindow(win.urlEdit, x, y, std::max(kUrlMinWidth, static_cast<int>(client.right) - x - kMargin), height, TRUE);
+    // The downloads button, while there is one, takes the toolbar's right end.
+    const int urlRight = LayoutDownloads(win, static_cast<int>(client.right) - kMargin, y, height);
+    ::MoveWindow(win.urlEdit, x, y, std::max(kUrlMinWidth, urlRight - x), height, TRUE);
 
     HideSuggestions(win);
     LayoutActiveWebView(win);
@@ -205,6 +212,7 @@ void SetToolbarControlsVisible(BrowserWindow& win, bool visible) {
     for (const HWND control : {win.backButton, win.forwardButton, win.reloadButton, win.closeTabButton, win.urlEdit}) {
         ShowControl(control, visible);
     }
+    ShowDownloadsButton(win, visible);
     if (!visible) HideSuggestions(win);
 }
 

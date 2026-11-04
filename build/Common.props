@@ -24,6 +24,10 @@
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <!-- Sources are UTF-8 without a BOM; without this MSVC reads them in the system code page. -->
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <!-- The C++ runtime is linked in, so a PC needs no Visual C++ redistributable for any of
+           this. Winamp's own plugins bring theirs (Microsoft.VC90.CRT beside winamp.exe). -->
+      <RuntimeLibrary Condition="'$(Configuration)'=='Debug'">MultiThreadedDebug</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(Configuration)'!='Debug'">MultiThreaded</RuntimeLibrary>
       <PreprocessorDefinitions>NOMINMAX;WIN32_LEAN_AND_MEAN;STRICT;_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>

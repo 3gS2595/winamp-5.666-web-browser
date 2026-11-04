@@ -1,7 +1,8 @@
-// Opening, switching, closing, reopening and moving tabs.
+// Opening, switching, selecting, closing, reopening and moving tabs.
 #include "browser.h"
 
 #include <algorithm>
+#include <iterator>
 #include <ranges>
 #include <utility>
 
@@ -13,14 +14,58 @@ namespace {
     return static_cast<int>(win.tabs.size());
 }
 
-// Re-syncs a window after the tab at index was taken out of it. It must still have tabs.
-void RefreshAfterTabRemoved(BrowserWindow& win, int index) {
-    if (win.active >= index) win.active = std::max(0, win.active - 1);
+[[nodiscard]] int SelectedCount(const BrowserWindow& win) noexcept {
+    return static_cast<int>(std::ranges::count(win.tabs, true, &Tab::selected));
+}
 
+[[nodiscard]] TabSelection CurrentSelection(const BrowserWindow& win) {
+    TabSelection selected;
+    for (const Tab& tab : win.tabs) selected.push_back(tab.selected);
+    return selected;
+}
+
+// Selects the tabs `selected` says, and repaints those whose look that changes. A tab
+// only looks selected while others are too; on its own it is just the active tab.
+void ApplySelection(BrowserWindow& win, const TabSelection& selected) {
+    const bool severalBefore = SelectedCount(win) > 1;
+    const bool severalAfter = std::ranges::count(selected, true) > 1;
+    for (int i = 0; i < TabCount(win) && i < static_cast<int>(selected.size()); ++i) {
+        Tab& tab = win.tabs[i];
+        const bool lookedSelected = tab.selected && severalBefore;
+        tab.selected = selected[i];
+        if (lookedSelected != (tab.selected && severalAfter) && tab.button) {
+            ::InvalidateRect(tab.button.get(), nullptr, FALSE);
+        }
+    }
+}
+
+[[nodiscard]] bool IsOneOf(const std::vector<int>& tabIds, int tabId) noexcept {
+    return std::ranges::find(tabIds, tabId) != tabIds.end();
+}
+
+// A tab leaves its window, or its place in it. As in Chrome, the tabs opened from it
+// count from then on as opened from the tab it was opened from.
+void PassOnOpener(BrowserWindow& win, const Tab& leaving) {
+    for (Tab& tab : win.tabs) {
+        if (tab.openerId == leaving.id) tab.openerId = leaving.openerId == tab.id ? 0 : leaving.openerId;
+    }
+}
+
+// The id of the tab that is to be the active one once the tabs in tabIds have gone:
+// the active tab if it stays, or else the nearest one that does, left of it first.
+[[nodiscard]] int ActiveAfterRemoving(const BrowserWindow& win, const std::vector<int>& tabIds) {
+    std::vector<bool> staying;
+    for (const Tab& tab : win.tabs) staying.push_back(!IsOneOf(tabIds, tab.id));
+    const int index = NearestWanted(staying, win.active);
+    return index >= 0 ? win.tabs[index].id : 0;
+}
+
+// Re-syncs a window after tabs were taken out of it. It must still have tabs, among
+// them activeId, which becomes the active one.
+void RefreshAfterTabsRemoved(BrowserWindow& win, int activeId) {
+    win.active = -1; // indices shifted; SwitchToTab below re-syncs everything
     LayoutToolbarAndTabs(win);
-    // Force a full refresh of the active tab's visuals since indices shifted.
-    const int current = std::exchange(win.active, -1);
-    SwitchToTab(win, current);
+    SwitchToTab(win, std::max(0, TabIndexById(win, activeId)));
 }
 
 // Puts a closing tab's webview away instead of closing it. The page is left for
@@ -41,7 +86,20 @@ void ParkClosedTab(Tab&& tab, std::wstring url) {
 
 } // namespace
 
+void CloseTabs(BrowserWindow& win, const std::vector<int>& tabIds) {
+    if (std::ranges::all_of(win.tabs, [&](const Tab& tab) { return IsOneOf(tabIds, tab.id); })) {
+        CloseBrowserWindow(win);
+        return;
+    }
+    const int activeId = ActiveAfterRemoving(win, tabIds);
+    for (const int tabId : tabIds) {
+        if (const int index = TabIndexById(win, tabId); index >= 0) RemoveTab(win, index);
+    }
+    RefreshAfterTabsRemoved(win, activeId);
+}
+
 void DiscardClosedWebView(ClosedTab& closed) {
+    KeepWebViewForDownloads(closed.tab);
     closed.tab.CloseWebView();
     closed.tab.favicon.reset();
 }
@@ -52,9 +110,61 @@ void UpdateTabTitle(BrowserWindow& win, int index, std::wstring_view title) {
     tab.title = title;
     if (tab.button) ::SetWindowTextW(tab.button.get(), tab.title.c_str());
     if (index == win.active) UpdateFrameTitle(win);
+    if (tab.playingAudio) FollowPageSound(); // Winamp may be showing it
 }
 
 void SwitchToTab(BrowserWindow& win, int index) {
+    if (win.isFullscreen || !IsTabIndex(win, index)) return;
+    TabSelection only(win.tabs.size(), false);
+    only[index] = true;
+    ApplySelection(win, only);
+    win.anchorTabId = win.tabs[index].id;
+    ActivateTab(win, index);
+}
+
+bool ToggleTabSelected(BrowserWindow& win, int index) {
+    if (win.isFullscreen || !IsTabIndex(win, index)) return false;
+    win.anchorTabId = win.tabs[index].id;
+    TabSelection selected = CurrentSelection(win);
+    if (!selected[index]) {
+        selected[index] = true;
+        ApplySelection(win, selected);
+        ActivateTab(win, index);
+        return true;
+    }
+    // The last of them stays: the active tab is always selected.
+    if (SelectedCount(win) <= 1) return true;
+    selected[index] = false;
+    if (index == win.active) ActivateTab(win, NearestWanted(selected, index));
+    ApplySelection(win, selected);
+    return false;
+}
+
+void SelectTabRange(BrowserWindow& win, int index, bool add) {
+    if (win.isFullscreen || !IsTabIndex(win, index)) return;
+    int anchor = TabIndexById(win, win.anchorTabId);
+    if (anchor < 0) {
+        anchor = IsTabIndex(win, win.active) ? win.active : index;
+        win.anchorTabId = win.tabs[anchor].id;
+    }
+    ApplySelection(win, SelectRange(CurrentSelection(win), anchor, index, add));
+    ActivateTab(win, index);
+}
+
+std::vector<int> SelectedTabIds(const BrowserWindow& win) {
+    std::vector<int> tabIds;
+    for (const Tab& tab : win.tabs) {
+        if (tab.selected) tabIds.push_back(tab.id);
+    }
+    if (tabIds.empty() && IsTabIndex(win, win.active)) tabIds.push_back(win.tabs[win.active].id);
+    return tabIds;
+}
+
+bool ShowsAsSelected(const BrowserWindow& win, int index) noexcept {
+    return IsTabIndex(win, index) && win.tabs[index].selected && SelectedCount(win) > 1;
+}
+
+void ActivateTab(BrowserWindow& win, int index) {
     if (win.isFullscreen) return; // the active tab's controller is parented elsewhere right now
     if (!IsTabIndex(win, index) || win.active == index) return;
 
@@ -80,14 +190,50 @@ void SwitchToTab(BrowserWindow& win, int index) {
     }
 }
 
+int ActiveTabId(const BrowserWindow& win) noexcept {
+    return IsTabIndex(win, win.active) ? win.tabs[win.active].id : 0;
+}
+
+int LinkTabIndex(const BrowserWindow& win, bool foreground) {
+    std::vector<int> openers;
+    for (const Tab& tab : win.tabs) openers.push_back(tab.openerId ? TabIndexById(win, tab.openerId) : -1);
+    return LinkTabPlace(openers, win.active, foreground);
+}
+
+void ForgetOpeners(BrowserWindow& win) {
+    for (Tab& tab : win.tabs) tab.openerId = 0;
+}
+
+void NoteUserSwitch(BrowserWindow& win, int fromTabId) {
+    const Tab* const to = ActiveTab(win);
+    const int from = TabIndexById(win, fromTabId);
+    if (!to || to->id == fromTabId) return;
+    if (SwitchForgetsOpeners(fromTabId, from >= 0 ? win.tabs[from].openerId : 0, to->id, to->openerId)) {
+        ForgetOpeners(win);
+    }
+}
+
+void NoteTypedNavigation(BrowserWindow& win) {
+    const Tab* const tab = ActiveTab(win);
+    if (!tab) return;
+    BOOL canGoBack = FALSE;
+    if (tab->webview) tab->webview->get_CanGoBack(&canGoBack);
+    const bool quickLook = win.active == TabCount(win) - 1 && !canGoBack;
+    if (!quickLook) ForgetOpeners(win);
+}
+
 void NextTab(BrowserWindow& win) {
     if (win.tabs.empty()) return;
+    const int fromTabId = ActiveTabId(win);
     SwitchToTab(win, (win.active + 1) % TabCount(win));
+    NoteUserSwitch(win, fromTabId);
 }
 
 void PrevTab(BrowserWindow& win) {
     if (win.tabs.empty()) return;
+    const int fromTabId = ActiveTabId(win);
     SwitchToTab(win, (win.active - 1 + TabCount(win)) % TabCount(win));
+    NoteUserSwitch(win, fromTabId);
 }
 
 void NewTab(BrowserWindow& win, std::wstring_view url) {
@@ -104,39 +250,43 @@ void RemoveTab(BrowserWindow& win, int index) {
     Tab tab = std::move(win.tabs[index]);
     win.tabs.erase(win.tabs.begin() + index);
     tab.button.reset();
+    EndHistoryCopy(tab);
+    PassOnOpener(win, tab);
+    tab.openerId = 0; // reopened, it starts afresh
 
     // The page it was on; for a tab never looked at, where it was headed.
     std::wstring closingUrl = !tab.lastUrl.empty() ? tab.lastUrl
                               : tab.webview        ? SourceOf(tab.webview.Get())
                                                    : tab.pendingUrl;
 
-    if (!closingUrl.empty() && tab.controller && tab.webview && !win.closing) {
+    // Tools on the debugging port see every webview there is. One put away would show up
+    // to them as a page, and one closed by a tool would never be seen to go.
+    if (!closingUrl.empty() && tab.controller && tab.webview && !win.closing && g_app.debuggingPort == 0) {
         // A tab that got as far as showing a page can be reopened, so it is put away
         // rather than closed.
         ParkClosedTab(std::move(tab), std::move(closingUrl));
         return;
     }
-    // Reopening it starts over at its address.
-    if (!closingUrl.empty()) g_app.closedTabs.push_back({.url = std::move(closingUrl)});
+    // Reopening it starts over at its address. Claude's tabs aren't the user's to reopen:
+    // they close when its session ends, and Ctrl+Shift+T would bring them back instead
+    // of the tab the user closed.
+    if (!closingUrl.empty() && !tab.forClaude) g_app.closedTabs.push_back({.url = std::move(closingUrl)});
     // A webview can't be kept past the window it is in: WebView2 closes it when that
     // window is destroyed. The webviews of a window closed for good go with it, which
     // frees all they held at once. Any other webview goes with `tab`.
     if (win.closing) win.discardedTabs.push_back(std::move(tab));
+    else KeepWebViewForDownloads(tab);
 }
 
 void CloseTab(BrowserWindow& win, int index) {
-    if (!IsTabIndex(win, index)) return;
-    // A window's last tab takes the window with it.
-    if (win.tabs.size() == 1) {
-        CloseBrowserWindow(win);
-        return;
-    }
-    RemoveTab(win, index);
-    RefreshAfterTabRemoved(win, index);
+    if (IsTabIndex(win, index)) CloseTabs(win, {win.tabs[index].id});
 }
 
+// As in Chrome, Ctrl+W and the close button take every selected tab.
 void CloseActiveTab(BrowserWindow& win) {
-    CloseTab(win, win.active);
+    const Tab* const active = ActiveTab(win);
+    if (!active) return;
+    CloseTabs(win, active->selected ? SelectedTabIds(win) : std::vector{active->id});
 }
 
 void ReopenLastClosedTab(BrowserWindow& win) {
@@ -184,47 +334,67 @@ void OpenHistory(BrowserWindow& win) {
     NewTab(win, kHistoryUrl);
 }
 
-// A tab can be dragged along its strip to reorder it, onto another window's strip
-// to move it there, or away from every strip to give it a window of its own.
-void MoveTab(BrowserWindow& src, int index, BrowserWindow& dst, int insertAt) {
-    if (!IsTabIndex(src, index)) return;
-    const bool sameWindow = &dst == &src;
-    insertAt = std::clamp(insertAt, 0, TabCount(dst) - (sameWindow ? 1 : 0));
+// Tabs can be dragged along their strip to reorder them, onto another window's strip
+// to move them there, or away from every strip to give them a window of their own.
+// Several selected tabs go together, and land side by side.
+void MoveTabs(BrowserWindow& src, const std::vector<int>& tabIds, BrowserWindow& dst, int insertAt, int activeTabId) {
+    std::vector<bool> moving;
+    for (const Tab& tab : src.tabs) moving.push_back(IsOneOf(tabIds, tab.id));
+    if (std::ranges::none_of(moving, std::identity{})) return;
 
-    if (sameWindow) {
-        if (insertAt == index) return;
-        const int activeId = src.active >= 0 ? src.tabs[src.active].id : 0;
-        const auto first = src.tabs.begin();
-        if (insertAt < index) std::rotate(first + insertAt, first + index, first + index + 1);
-        else std::rotate(first + index, first + index + 1, first + insertAt + 1);
+    for (int i = 0; i < TabCount(src); ++i) {
+        if (moving[i]) PassOnOpener(src, src.tabs[i]);
+    }
+
+    if (&dst == &src) {
+        const int activeId = IsTabIndex(src, src.active) ? src.tabs[src.active].id : 0;
+        std::vector<Tab> reordered;
+        reordered.reserve(src.tabs.size());
+        for (const int from : GatheredOrder(moving, insertAt)) reordered.push_back(std::move(src.tabs[from]));
+        src.tabs = std::move(reordered);
         src.active = TabIndexById(src, activeId);
         LayoutToolbarAndTabs(src); // renumbers and repositions the tab buttons
-        ShowTabInStrip(src, insertAt);
+        ShowTabInStrip(src, std::max(0, TabIndexById(src, activeTabId)));
         for (const Tab& tab : src.tabs) {
             if (tab.button) ::InvalidateRect(tab.button.get(), nullptr, TRUE);
         }
         return;
     }
 
-    Tab tab = std::move(src.tabs[index]);
-    src.tabs.erase(src.tabs.begin() + index);
+    const int srcActiveId = ActiveAfterRemoving(src, tabIds);
+    std::vector<Tab> moved, staying;
+    for (int i = 0; i < TabCount(src); ++i) (moving[i] ? moved : staying).push_back(std::move(src.tabs[i]));
+    src.tabs = std::move(staying);
 
-    // Tab buttons are children of their window's client, so dst makes a fresh one
-    // on layout. The webview itself just moves to the new parent.
-    tab.button.reset();
-    if (tab.controller) {
-        tab.controller->put_IsVisible(FALSE);
-        tab.controller->put_ParentWindow(dst.client);
+    // Tab buttons are children of their window's client, so dst makes fresh ones on
+    // layout. The webviews themselves just move to the new parent.
+    for (Tab& tab : moved) {
+        tab.button.reset();
+        tab.openerId = 0; // the tab it was opened from stays behind
+        if (tab.controller) {
+            tab.controller->put_IsVisible(FALSE);
+            tab.controller->put_ParentWindow(dst.client);
+        }
     }
 
-    if (src.tabs.empty()) CloseBrowserWindow(src); // its last tab was dragged away
-    else RefreshAfterTabRemoved(src, index);
+    if (src.tabs.empty()) CloseBrowserWindow(src); // its last tabs were dragged away
+    else RefreshAfterTabsRemoved(src, srcActiveId);
 
-    dst.tabs.insert(dst.tabs.begin() + insertAt, std::move(tab));
+    insertAt = std::clamp(insertAt, 0, TabCount(dst));
+    const int count = static_cast<int>(moved.size());
+    dst.tabs.insert(dst.tabs.begin() + insertAt, std::make_move_iterator(moved.begin()),
+                    std::make_move_iterator(moved.end()));
     dst.active = -1; // indices shifted; SwitchToTab below re-syncs everything
     LayoutToolbarAndTabs(dst);
-    SwitchToTab(dst, insertAt);
-    if (Tab& moved = dst.tabs[insertAt]; moved.controller) moved.controller->NotifyParentWindowPositionChanged();
+    const int activeIndex = TabIndexById(dst, activeTabId);
+    SwitchToTab(dst, activeIndex >= 0 ? activeIndex : insertAt);
+
+    TabSelection selected(dst.tabs.size(), false);
+    for (int i = insertAt; i < insertAt + count; ++i) {
+        selected[i] = true;
+        if (dst.tabs[i].controller) dst.tabs[i].controller->NotifyParentWindowPositionChanged();
+    }
+    ApplySelection(dst, selected);
 }
 
 } // namespace exodium

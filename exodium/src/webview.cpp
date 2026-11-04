@@ -2,8 +2,10 @@
 // that opens a window is given, and all of them again after the browser process dies.
 #include "browser.h"
 
+#include <WebView2EnvironmentOptions.h>
 #include <wrl/event.h>
 
+#include <string>
 #include <utility>
 
 namespace exodium {
@@ -14,6 +16,17 @@ using Microsoft::WRL::Callback;
 
 using ControllerCompletedHandler = ICoreWebView2CreateCoreWebView2ControllerCompletedHandler;
 using EnvironmentCompletedHandler = ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler;
+
+// Tools outside the browser, such as Claude Code, drive it over the DevTools protocol on
+// the port winamp.ini names. There is none unless it does: anything running on this
+// machine can use that port, and with it every site the browser is signed in to.
+[[nodiscard]] ComPtr<ICoreWebView2EnvironmentOptions> EnvironmentOptions() {
+    if (g_app.debuggingPort == 0) return nullptr;
+    auto options = Microsoft::WRL::Make<CoreWebView2EnvironmentOptions>();
+    const std::wstring arguments = L"--remote-debugging-port=" + std::to_wstring(g_app.debuggingPort);
+    options->put_AdditionalBrowserArguments(arguments.c_str());
+    return options;
+}
 
 // Makes the environment if there is none yet, then calls `onReady`. Callers that
 // arrive while it is being made wait for the same one.
@@ -32,7 +45,7 @@ void WithEnvironment(std::move_only_function<void()> onReady) {
         g_app.environmentWaiters.clear(); // whoever asks next tries again
     };
     const HRESULT started = ::CreateCoreWebView2EnvironmentWithOptions(
-        nullptr, WebViewProfileDir().c_str(), nullptr,
+        nullptr, WebViewProfileDir().c_str(), EnvironmentOptions().Get(),
         Callback<EnvironmentCompletedHandler>([failed](HRESULT result,
                                                        ICoreWebView2Environment* environment) -> HRESULT {
             if (FAILED(result) || !environment) {
@@ -89,7 +102,9 @@ void OnTabControllerCreated(int tabId, HWND createdIn, HRESULT result, ICoreWebV
     AdoptController(win, tab, controller, createdIn);
     PreferDarkColorScheme(tab.webview.Get());
     WireTabEvents(tabId);
-    tab.webview->Navigate(tab.pendingUrl.empty() ? kDefaultUrl : tab.pendingUrl.c_str());
+    // A tab opened from Back or Forward makes its history first; see back_forward.cpp.
+    if (tab.historyCopy) StartHistoryCopy(tabId);
+    else tab.webview->Navigate(tab.pendingUrl.empty() ? HomePage().c_str() : tab.pendingUrl.c_str());
 
     if (at.isActive()) {
         LayoutActiveWebView(win);
@@ -127,6 +142,37 @@ void OnTabControllerCreated(int tabId, HWND createdIn, HRESULT result, ICoreWebV
     return popup;
 }
 
+// How long after the page's context menu was opened on a link a request for that link
+// is still taken to come from the menu.
+constexpr ULONGLONG kMenuLinkMs = 30'000;
+
+// The webview's own context menu has "Open link in new window", which opens a tab here,
+// as Chrome's "Open link in new tab" does. Chrome opens that one behind the tab in view.
+// Which entry was picked isn't told, but a request for the very link the menu was opened
+// on, made soon after, is that one.
+[[nodiscard]] bool OpenedFromLinkMenu(int sourceTabId, ICoreWebView2NewWindowRequestedEventArgs* args) {
+    const TabLocation source = FindTab(sourceTabId);
+    if (!source) return false;
+    Tab& tab = source.tab();
+    const std::wstring link = std::exchange(tab.menuLink, {});
+    if (link.empty() || ::GetTickCount64() - tab.menuLinkAt > kMenuLinkMs) return false;
+    return ComString(args, &ICoreWebView2NewWindowRequestedEventArgs::get_Uri) == link;
+}
+
+// Whether a tab a page opened is left behind the tab in view, as in Chrome: one opened
+// with Ctrl held, or from the page's context menu. Ctrl+Shift brings it into view. The
+// event doesn't say how the link was clicked, but it arrives while the keys are still down.
+[[nodiscard]] bool OpensBehind(int sourceTabId, ICoreWebView2NewWindowRequestedEventArgs* args) {
+    BOOL byUser = FALSE;
+    args->get_IsUserInitiated(&byUser);
+    if (!byUser) return false;
+    const bool ctrl = (::GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool shift = (::GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    // Asked first, so that the menu's link is let go of whatever the keys say.
+    const bool fromMenu = OpenedFromLinkMenu(sourceTabId, args);
+    return (ctrl && !shift) || (fromMenu && !ctrl);
+}
+
 } // namespace
 
 std::wstring SourceOf(ICoreWebView2* webview) {
@@ -144,10 +190,21 @@ void UpdateTabAudio(Tab& tab) {
     if (tab.webview && SUCCEEDED(tab.webview.As(&webview8))) webview8->get_IsDocumentPlayingAudio(&playing);
     if (std::exchange(tab.playingAudio, playing != FALSE) == (playing != FALSE)) return;
     if (tab.button) ::InvalidateRect(tab.button.get(), nullptr, FALSE);
+    FollowPageSound();
 }
 
 void MoveFocusToWebView(Tab& tab) {
-    if (tab.controller) tab.controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+    if (!tab.controller) return;
+    // A tab of Claude's doesn't take the keyboard into a window the user isn't in: giving
+    // it to a page in a window that isn't active would make that window the active one.
+    if (tab.forClaude) {
+        HWND parent = nullptr;
+        if (FAILED(tab.controller->get_ParentWindow(&parent)) ||
+            ::GetAncestor(parent, GA_ROOT) != ::GetForegroundWindow()) {
+            return;
+        }
+    }
+    tab.controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
 }
 
 void CreateWebViewForTab(BrowserWindow& owner, int tabId) {
@@ -179,7 +236,7 @@ void CreateWebViewForTab(BrowserWindow& owner, int tabId) {
 // only works if we give WebView2 a real CoreWebView2 via put_NewWindow — a plain new
 // tab leaves window.open() returning null and breaks those sign-in flows. The same
 // holds whether the webview ends up in a tab of this window or in a window of its own.
-void OpenRequestedWindow(BrowserWindow& win, ICoreWebView2NewWindowRequestedEventArgs* request) {
+void OpenRequestedWindow(BrowserWindow& win, int sourceTabId, ICoreWebView2NewWindowRequestedEventArgs* request) {
     ComPtr<ICoreWebView2NewWindowRequestedEventArgs> args(request);
     ComPtr<ICoreWebView2Deferral> deferral;
     args->GetDeferral(&deferral);
@@ -190,25 +247,34 @@ void OpenRequestedWindow(BrowserWindow& win, ICoreWebView2NewWindowRequestedEven
     const bool isPopup = popupWindow != nullptr;
     BrowserWindow& host = isPopup ? *popupWindow : win;
 
-    const int index = static_cast<int>(host.tabs.size());
-    Tab& added = AddTab(host, kNewTabTitle);
+    // A tab in the opener's window goes beside the tab in view, as in Chrome, and counts
+    // as opened from it. One brought into view starts afresh: the tabs opened before it
+    // no longer count as opened from anywhere.
+    const bool behind = !isPopup && OpensBehind(sourceTabId, request);
+    const int index = isPopup ? 0 : LinkTabIndex(host, !behind);
+    const int openerId = isPopup ? 0 : ActiveTabId(host);
+    if (!isPopup && !behind) ForgetOpeners(host);
+    const TabLocation source = FindTab(sourceTabId);
+    const bool forClaude = source && source.tab().forClaude;
+    const std::uint32_t claudeSession = source ? source.tab().claudeSession : 0;
+    Tab& added = AddTab(host, kNewTabTitle, index);
     added.creating = true;
+    added.openerId = openerId;
+    added.forClaude = forClaude;
+    added.claudeSession = claudeSession;
     const int tabId = added.id;
     LayoutToolbarAndTabs(host);
 
     if (isPopup) {
         SwitchToTab(host, index);
-        ::ShowWindow(host.frame, SW_SHOWNA);
-        ::SetForegroundWindow(host.frame);
-    } else {
-        // Ctrl+click opens the link in the background, as browsers do; adding Shift
-        // goes to it. The event doesn't say how the link was clicked, but it arrives
-        // while the keys are still down.
-        BOOL byUser = FALSE;
-        args->get_IsUserInitiated(&byUser);
-        const bool inBackground =
-            byUser && (::GetAsyncKeyState(VK_CONTROL) & 0x8000) && !(::GetAsyncKeyState(VK_SHIFT) & 0x8000);
-        if (!inBackground) SwitchToTab(host, index);
+        if (forClaude) {
+            ShowWithoutFocus(host);
+        } else {
+            ::ShowWindow(host.frame, SW_SHOWNA);
+            ::SetForegroundWindow(host.frame);
+        }
+    } else if (!behind) {
+        SwitchToTab(host, index);
     }
 
     const HWND parent = host.client;
@@ -262,10 +328,24 @@ void ReviveWebViews() {
         UpdateReloadButton(*win);
     }
     for (ClosedTab& closed : g_app.closedTabs) DiscardClosedWebView(closed);
+    AbandonDownloads();
     g_app.environment.Reset(); // it belonged to the dead process; the next webview asked for makes a new one
 
     for (const auto& win : g_app.windows) {
         if (::IsWindowVisible(win->frame)) ::PostMessageW(win->client, kMsgInitWebView, 0, 0);
+    }
+}
+
+// A page a tool makes through the debugging port is a window of the browser process's
+// own, which no tab of ours knows about. It would keep that process going after Winamp
+// has gone, and the port open with it. Any webview will do to pass the word on.
+void CloseBrowserProcess() {
+    for (const auto& win : g_app.windows) {
+        for (const Tab& tab : win->tabs) {
+            if (!tab.webview) continue;
+            tab.webview->CallDevToolsProtocolMethod(L"Browser.close", L"{}", nullptr);
+            return;
+        }
     }
 }
 

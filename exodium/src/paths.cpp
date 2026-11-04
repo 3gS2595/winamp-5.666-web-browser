@@ -47,4 +47,8 @@ std::filesystem::path ZoomFile() {
     return DataDir() / L"zoom.txt";
 }
 
+std::filesystem::path OpenerProgram() {
+    return ModuleDir() / L"exodium_open.exe";
+}
+
 } // namespace exodium

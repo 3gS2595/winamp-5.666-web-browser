@@ -31,6 +31,7 @@ using UniqueDc = UniqueHandle<HDC, &::DeleteDC>; // a DC made with CreateCompati
 using UniqueBrush = UniqueHandle<HBRUSH, &::DeleteObject>;
 using UniquePen = UniqueHandle<HPEN, &::DeleteObject>;
 using UniqueBitmap = UniqueHandle<HBITMAP, &::DeleteObject>;
+using UniqueHook = UniqueHandle<HHOOK, &::UnhookWindowsHookEx>;
 
 // Selects a GDI object into a DC and puts the previous one back afterwards.
 class SelectedObject {

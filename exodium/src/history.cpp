@@ -54,7 +54,7 @@ const HistoryEntry* History::Find(std::wstring_view url) const noexcept {
 }
 
 void History::RecordVisit(std::wstring_view url, std::wstring_view title, bool typed, std::int64_t now) {
-    if (!IsLikelyHttpUrl(url) || url == kHistoryUrl) return;
+    if (!IsLikelyHttpUrl(url) || url == kHistoryUrl || url.contains(kToolStartPage)) return;
 
     if (const auto known = Locate(url); known != entries_.end()) {
         std::rotate(entries_.begin(), known, known + 1);

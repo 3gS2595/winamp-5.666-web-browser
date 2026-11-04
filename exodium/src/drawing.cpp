@@ -1,6 +1,8 @@
 #include "browser.h"
 
 #include "gdiplus_headers.h"
+#include "search_engines.h"
+#include "tab_parts.h"
 
 #include <algorithm>
 #include <array>
@@ -9,8 +11,9 @@ namespace exodium {
 
 namespace {
 
-constexpr int kIconSize = 16;
-constexpr int kIconPadding = 4;
+constexpr int kIconSize = kTabIconSize;
+constexpr float kCloseCrossInset = 4.0f; // between the close button's edges and its cross
+constexpr float kCloseCrossWidth = 1.5f;
 constexpr float kSpinnerInset = 2.0f;
 constexpr float kSpinnerSweep = 270.0f; // three quarters of a ring
 constexpr int kSuggestionPadding = 6;
@@ -46,13 +49,38 @@ void DrawSpinner(HDC dc, int x, int y) {
     graphics.DrawArc(&ring, x + kSpinnerInset, y + kSpinnerInset, size, size, turn, kSpinnerSweep);
 }
 
+// A tab's close button: a cross, on a disc while the mouse is over it, and on a lighter
+// one while it is held down.
+void DrawCloseButton(HDC dc, const TabBox& box, bool hot, bool pressed) {
+    Gdiplus::Graphics graphics(dc);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    // GDI+ has the middle of a pixel on whole coordinates, so the disc over the button's
+    // pixels runs from half a pixel before its first to half a pixel after its last.
+    if (hot || pressed) {
+        Gdiplus::Color discColor;
+        discColor.SetFromCOLORREF(pressed ? color::kClosePressed : color::kCloseHot);
+        const Gdiplus::SolidBrush disc(discColor);
+        graphics.FillEllipse(&disc, box.left - 0.5f, box.top - 0.5f, static_cast<float>(box.width()),
+                             static_cast<float>(box.height()));
+    }
+    Gdiplus::Color crossColor;
+    crossColor.SetFromCOLORREF(hot || pressed ? color::kText : color::kCloseCross);
+    const Gdiplus::Pen cross(crossColor, kCloseCrossWidth);
+    const float left = box.left + kCloseCrossInset, right = box.right - 1 - kCloseCrossInset;
+    const float top = box.top + kCloseCrossInset, bottom = box.bottom - 1 - kCloseCrossInset;
+    graphics.DrawLine(&cross, left, top, right, bottom);
+    graphics.DrawLine(&cross, left, bottom, right, top);
+}
+
 } // namespace
 
 // A tab shows its page's icon, which gives way to a spinner while the tab is busy
-// and to a mark once it has crashed. A speaker at its other end, as in Chrome, says
-// that its page is making sound. In a tab too narrow for both, the speaker is shown
-// in place of the icon.
-void DrawOwnerButton(const DRAWITEMSTRUCT& item, const Tab* tab, bool isActive) {
+// and to a mark once it has crashed. A speaker towards its other end, as in Chrome, says
+// that its page is making sound, and a close button is at the very end, lit while the
+// mouse is over it. A narrow tab leaves out what it has no room for: see tab_parts.h.
+// Each of several tabs selected together has a border of its own colour, and those not
+// in view are a shade lighter than the rest.
+void DrawOwnerButton(const DRAWITEMSTRUCT& item, const Tab* tab, const ButtonLook& look) {
     // Drawn off screen and copied over in one go, so that a turning spinner never
     // shows half painted.
     const RECT rect = item.rcItem;
@@ -63,37 +91,38 @@ void DrawOwnerButton(const DRAWITEMSTRUCT& item, const Tab* tab, bool isActive) 
     const SelectedObject selectedFont(dc, g_app.theme.font);
 
     const Theme& theme = g_app.theme;
-    ::FillRect(dc, &rect, (tab && isActive ? theme.activeTab : theme.panel).get());
-    ::FrameRect(dc, &rect, theme.border.get());
+    const bool inSelection = tab && look.inSelection;
+    const UniqueBrush& fill = tab && look.active ? theme.activeTab : inSelection ? theme.selectedTab : theme.panel;
+    ::FillRect(dc, &rect, fill.get());
+    ::FrameRect(dc, &rect, (inSelection ? theme.selectedBorder : theme.border).get());
     ::SetBkMode(dc, TRANSPARENT);
 
     RECT textRect = rect;
-    const int iconY = rect.top + (Height(rect) - kIconSize) / 2;
-    const bool busy = tab && tab->busy();
-    const bool sounding = tab && tab->playingAudio;
-    const bool speakerOnly = sounding && Width(rect) < 2 * (kIconSize + 2 * kIconPadding);
-    if (sounding && !speakerOnly) {
-        textRect.right -= kIconSize + kIconPadding * 2;
-        DrawSpeaker(dc, textRect.right + kIconPadding, iconY);
-    }
-    if (tab && (busy || tab->crashed || tab->favicon || speakerOnly)) {
-        const int iconX = rect.left + kIconPadding;
-        if (speakerOnly) {
-            DrawSpeaker(dc, iconX, iconY);
-        } else if (busy) {
-            DrawSpinner(dc, iconX, iconY);
-        } else if (tab->crashed) {
-            RECT mark{iconX, iconY, iconX + kIconSize, iconY + kIconSize};
-            ::SetTextColor(dc, color::kCrashed);
-            ::DrawTextW(dc, L"!", 1, &mark, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        } else {
-            ::DrawIconEx(dc, iconX, iconY, tab->favicon.get(), kIconSize, kIconSize, 0, nullptr, DI_NORMAL);
+    if (tab) {
+        const bool busy = tab->busy();
+        const TabParts parts = PlaceTabParts({rect.left, rect.top, rect.right, rect.bottom},
+                                             {.icon = busy || tab->crashed || tab->favicon,
+                                              .speaker = tab->playingAudio,
+                                              .closeButton = g_app.settings.tabCloseButtons,
+                                              .active = look.closeAlways});
+        if (const TabBox& icon = parts.icon; !icon.empty()) {
+            if (busy) {
+                DrawSpinner(dc, icon.left, icon.top);
+            } else if (tab->crashed) {
+                RECT mark{icon.left, icon.top, icon.right, icon.bottom};
+                ::SetTextColor(dc, color::kCrashed);
+                ::DrawTextW(dc, L"!", 1, &mark, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            } else {
+                ::DrawIconEx(dc, icon.left, icon.top, tab->favicon.get(), kIconSize, kIconSize, 0, nullptr, DI_NORMAL);
+            }
         }
-        textRect.left += kIconSize + kIconPadding * 2;
+        if (!parts.speaker.empty()) DrawSpeaker(dc, parts.speaker.left, parts.speaker.top);
+        if (!parts.close.empty()) DrawCloseButton(dc, parts.close, look.closeHot, look.closePressed);
+        textRect = {parts.title.left, parts.title.top, parts.title.right, parts.title.bottom};
     }
 
     // DT_NOPREFIX: an ampersand in a page's title is an ampersand, not a shortcut mark.
-    const std::wstring text = WindowText(item.hwndItem);
+    const std::wstring text = look.text ? *look.text : WindowText(item.hwndItem);
     ::SetTextColor(dc, color::kText);
     ::DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &textRect,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -101,7 +130,8 @@ void DrawOwnerButton(const DRAWITEMSTRUCT& item, const Tab* tab, bool isActive) 
     if (item.itemState & ODS_FOCUS) {
         RECT focus = textRect;
         ::InflateRect(&focus, -3, -3);
-        ::DrawFocusRect(dc, &focus);
+        // A tab too narrow to show its title has none to go round.
+        if (!::IsRectEmpty(&focus)) ::DrawFocusRect(dc, &focus);
     }
 
     ::BitBlt(item.hDC, rect.left, rect.top, Width(rect), Height(rect), dc, rect.left, rect.top, SRCCOPY);
@@ -116,12 +146,12 @@ void DrawSuggestion(const BrowserWindow& win, const DRAWITEMSTRUCT& item) {
     const Theme& theme = g_app.theme;
     ::FillRect(dc, &rect, ((item.itemState & ODS_SELECTED) ? theme.suggestSelected : theme.panel).get());
 
-    // A page reads "Title - address" and a search "words - Google Search". An address
-    // whose title isn't known stands alone.
+    // A page reads "Title - address" and a search "words - Google Search", or whichever
+    // engine is in use. An address whose title isn't known stands alone.
     const bool titled = !suggestion.search && !suggestion.title.empty();
     const std::wstring& lead = titled ? suggestion.title : suggestion.text;
     std::wstring tail;
-    if (suggestion.search) tail = L" - Google Search";
+    if (suggestion.search) tail = L" - " + SearchLabel();
     else if (titled) tail = L" - " + suggestion.text;
 
     ::SetBkMode(dc, TRANSPARENT);

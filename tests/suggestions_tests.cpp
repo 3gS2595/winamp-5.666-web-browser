@@ -21,6 +21,18 @@ SuggestionList Suggest(const History& history, std::wstring_view typed, bool all
     return BuildSuggestions(history.entries(), typed, allowCompletion, kNow);
 }
 
+// What the × at a row's end does to the history.
+void Forget(History& history, const Suggestion& row) {
+    for (const std::wstring& url : PagesBehind(history.entries(), row)) history.Remove(url);
+}
+
+// The addresses a history holds, latest first, with a space between.
+std::wstring UrlsOf(const History& history) {
+    std::wstring urls;
+    for (const HistoryEntry& entry : history.entries()) urls.append(urls.empty() ? L"" : L" ").append(entry.url);
+    return urls;
+}
+
 } // namespace
 
 TEST_CASE(NothingTypedSuggestsNothing) {
@@ -204,6 +216,125 @@ TEST_CASE(SuggestionsFromALongHistoryAreTheSame) {
     // Those worth the same stay in the history's order, latest first.
     EXPECT_EQ(list.rows[2].url, L"https://site0.example/page/0");
     EXPECT_EQ(list.rows[3].url, L"https://site1.example/page/1");
+}
+
+TEST_CASE(RowsSayWhatOfTheHistoryIsBehindThem) {
+    const History history = Visited(
+        {L"https://docs.rs/alpha", L"https://docs.rs/beta", L"https://www.google.com/search?q=doc+comments&hl=en"});
+    const SuggestionList list = Suggest(history, L"doc");
+    EXPECT_EQ(list.rows.size(), std::size_t{5});
+    // The site its pages speak for, the typed text, the two pages, the search made before.
+    EXPECT_EQ(list.rows[0].text, L"docs.rs");
+    EXPECT(list.rows[0].behind == HistoryBehind::kSite);
+    EXPECT_EQ(list.rows[1].text, L"doc");
+    EXPECT(list.rows[1].behind == HistoryBehind::kNothing);
+    EXPECT_EQ(list.rows[2].url, L"https://docs.rs/beta");
+    EXPECT(list.rows[2].behind == HistoryBehind::kPage);
+    EXPECT(list.rows[3].behind == HistoryBehind::kPage);
+    EXPECT_EQ(list.rows[4].text, L"doc comments");
+    EXPECT(list.rows[4].behind == HistoryBehind::kSearch);
+
+    // An address that goes on past the site's name is a page, not the site.
+    const SuggestionList page = Suggest(history, L"docs.rs/al");
+    EXPECT_EQ(page.rows[1].url, L"https://docs.rs/alpha");
+    EXPECT(page.rows[1].behind == HistoryBehind::kPage);
+
+    // Nothing typed before has anything behind it.
+    const SuggestionList fresh = Suggest(history, L"zebra");
+    EXPECT_EQ(fresh.rows.size(), std::size_t{1});
+    EXPECT(PagesBehind(history.entries(), fresh.rows[0]).empty());
+}
+
+TEST_CASE(ForgettingAPageLeavesTheOthers) {
+    History history = Visited({L"https://docs.rs/alpha", L"https://docs.rs/beta"});
+    Forget(history, Suggest(history, L"alp").rows[1]);
+    EXPECT_EQ(UrlsOf(history), L"https://docs.rs/beta");
+    EXPECT_EQ(Suggest(history, L"alp").rows.size(), std::size_t{1});
+
+    // Visited again, it is suggested again.
+    history.RecordVisit(L"https://docs.rs/alpha", L"", false, kNow);
+    EXPECT_EQ(Suggest(history, L"alp").rows[1].url, L"https://docs.rs/alpha");
+}
+
+TEST_CASE(ForgettingASiteTakesEveryPageOnIt) {
+    History history = Visited({L"https://docs.rs/alpha", L"https://www.docs.rs/beta", L"http://docs.rs/",
+                               L"https://docs.rs.example/", L"https://other.example/docs.rs"});
+    const SuggestionList list = Suggest(history, L"docs.r");
+    EXPECT_EQ(list.rows[0].text, L"docs.rs");
+    Forget(history, list.rows[0]);
+    // Over http and https, with "www." and without; but no site that only begins the same,
+    // and no page that only names it.
+    EXPECT_EQ(UrlsOf(history), L"https://other.example/docs.rs https://docs.rs.example/");
+    const SuggestionList after = Suggest(history, L"docs.r");
+    EXPECT(after.inlineCompletion.empty());
+    EXPECT_EQ(after.rows[1].text, L"docs.rs.example");
+
+    // A page of the site visited again brings the site back.
+    history.RecordVisit(L"https://docs.rs/gamma", L"", true, kNow);
+    EXPECT_EQ(Suggest(history, L"docs.r").rows[0].text, L"docs.rs");
+}
+
+TEST_CASE(ASiteIsForgottenAsItWasTyped) {
+    // Typed with its "www.", the row names the site with it, and the pages without aren't behind it.
+    History history = Visited({L"https://www.docs.rs/alpha", L"https://docs.rs/beta"});
+    const SuggestionList list = Suggest(history, L"www.do");
+    EXPECT_EQ(list.rows[1].text, L"www.docs.rs");
+    Forget(history, list.rows[1]);
+    EXPECT_EQ(UrlsOf(history), L"https://docs.rs/beta");
+}
+
+TEST_CASE(ForgettingASearchTakesEveryResultsPageOfIt) {
+    History history = Visited({L"https://www.google.com/search?q=modern+c%2B%2B&hl=en",
+                               L"https://www.google.com/search?q=Modern+C%2B%2B&start=10",
+                               L"https://www.google.com/search?q=modern+art", L"https://plain.example/modern"});
+    // The same words in other letters are the same search, listed once: the latest of them.
+    const SuggestionList list = Suggest(history, L"modern c");
+    EXPECT_EQ(list.rows.size(), std::size_t{2});
+    EXPECT_EQ(list.rows[1].text, L"Modern C++");
+    Forget(history, list.rows[1]);
+    EXPECT_EQ(UrlsOf(history), L"https://plain.example/modern https://www.google.com/search?q=modern+art");
+
+    // Typed out in full, a search made before is the top row, and is forgotten from there.
+    const SuggestionList whole = Suggest(history, L"Modern Art");
+    EXPECT_EQ(whole.rows.size(), std::size_t{1});
+    EXPECT(whole.rows[0].behind == HistoryBehind::kSearch);
+    Forget(history, whole.rows[0]);
+    EXPECT_EQ(UrlsOf(history), L"https://plain.example/modern");
+    EXPECT(Suggest(history, L"Modern Art").rows[0].behind == HistoryBehind::kNothing);
+}
+
+TEST_CASE(ABookmarkIsNotForgotten) {
+    Bookmarks bookmarks;
+    EXPECT(bookmarks.Add(L"https://threejs.org/docs/", L"three.js docs", kNow));
+    const auto suggest = [&bookmarks](const History& history, std::wstring_view typed) {
+        return BuildSuggestions(history.entries(), typed, true, kNow, bookmarks.entries());
+    };
+
+    // On its own it has nothing behind it, as a page or as the site it speaks for.
+    History history;
+    EXPECT(suggest(history, L"docs").rows[1].behind == HistoryBehind::kNothing);
+    EXPECT(suggest(history, L"thr").rows[0].behind == HistoryBehind::kNothing);
+
+    // In the history as well, that much of it can be forgotten, and it stays for its star.
+    history.RecordVisit(L"https://threejs.org/docs/", L"three.js docs", false, kNow);
+    const SuggestionList both = suggest(history, L"docs");
+    EXPECT(both.rows[1].bookmarked);
+    EXPECT(both.rows[1].behind == HistoryBehind::kPage);
+    EXPECT(suggest(history, L"thr").rows[0].behind == HistoryBehind::kSite);
+    // So it is as the address that is filled in, whichever of the two counts for more.
+    for (const bool typed : {false, true}) {
+        history.RecordVisit(L"https://threejs.org/docs/", L"", typed, kNow);
+        const SuggestionList filled = suggest(history, L"threejs.org/d");
+        EXPECT_EQ(filled.inlineCompletion, L"ocs/");
+        EXPECT(filled.rows[0].bookmarked);
+        EXPECT(filled.rows[0].behind == HistoryBehind::kPage);
+    }
+    Forget(history, both.rows[1]);
+    EXPECT(history.entries().empty());
+    const SuggestionList left = suggest(history, L"docs");
+    EXPECT_EQ(left.rows[1].url, L"https://threejs.org/docs/");
+    EXPECT(left.rows[1].bookmarked);
+    EXPECT(left.rows[1].behind == HistoryBehind::kNothing);
 }
 
 TEST_CASE(ListIsCapped) {

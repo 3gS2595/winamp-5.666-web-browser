@@ -6,8 +6,10 @@
 #include "text_util.h"
 
 #include <commctrl.h>
+#include <windowsx.h>
 
 #include <algorithm>
+#include <utility>
 
 namespace exodium {
 
@@ -63,6 +65,63 @@ void ShowUserText(BrowserWindow& win) {
     ::SendMessageW(win.urlEdit, EM_SCROLLCARET, 0, 0);
 }
 
+// ---- the × at the end of a row the history is behind, which forgets the row ----
+//
+// It works as a tab's close button does: the mouse going down on it neither picks its row
+// nor goes anywhere, and the row is only forgotten if the mouse is let go over it.
+
+[[nodiscard]] RECT SuggestionRowRect(const BrowserWindow& win, int row) noexcept {
+    RECT rect{};
+    ::SendMessageW(win.suggestList, LB_GETITEMRECT, static_cast<WPARAM>(row), reinterpret_cast<LPARAM>(&rect));
+    return rect;
+}
+
+void RepaintSuggestion(const BrowserWindow& win, int row) noexcept {
+    if (row < 0) return;
+    const RECT rect = SuggestionRowRect(win, row);
+    ::InvalidateRect(win.suggestList, &rect, FALSE);
+}
+
+// The row whose × is at a point of the list; -1 if the point is on no row's.
+[[nodiscard]] int RemoveRowAt(const BrowserWindow& win, POINT point) noexcept {
+    const LRESULT hit = ::SendMessageW(win.suggestList, LB_ITEMFROMPOINT, 0, MAKELPARAM(point.x, point.y));
+    const int row = LOWORD(hit);
+    if (HIWORD(hit) || row >= static_cast<int>(win.suggestions.size())) return -1; // outside the rows
+    if (win.suggestions[row].behind == HistoryBehind::kNothing) return -1;
+    const RECT box = SuggestionRemoveBox(SuggestionRowRect(win, row));
+    return ::PtInRect(&box, point) ? row : -1;
+}
+
+// The same for where the mouse is now, which it may not have moved to since the rows changed.
+[[nodiscard]] int RemoveRowUnderMouse(const BrowserWindow& win) noexcept {
+    POINT cursor{};
+    if (!::GetCursorPos(&cursor) || ::WindowFromPoint(cursor) != win.suggestList) return -1;
+    ::ScreenToClient(win.suggestList, &cursor);
+    return RemoveRowAt(win, cursor);
+}
+
+// Lights the × of a row, or of none, and puts out any other.
+void SetHotRemove(BrowserWindow& win, int row) {
+    const int was = std::exchange(win.suggestRemoveHot, row);
+    if (was == row) return;
+    RepaintSuggestion(win, was);
+    RepaintSuggestion(win, row);
+    if (row >= 0) {
+        // To hear when the mouse leaves, and put it out again.
+        TRACKMOUSEEVENT track{.cbSize = sizeof(track), .dwFlags = TME_LEAVE, .hwndTrack = win.suggestList};
+        ::TrackMouseEvent(&track);
+    }
+}
+
+// Lets go of a × that is held down, without forgetting anything.
+void EndRemovePress(BrowserWindow& win) {
+    // Cleared first: releasing capture comes back here through WM_CAPTURECHANGED.
+    const int pressed = std::exchange(win.suggestRemovePressed, -1);
+    if (pressed < 0) return;
+    if (::GetCapture() == win.suggestList) ::ReleaseCapture();
+    RepaintSuggestion(win, pressed);
+}
+
 // Rebuilds the list for win.userText.
 void UpdateSuggestions(BrowserWindow& win, bool allowCompletion) {
     SuggestionList list =
@@ -82,7 +141,25 @@ void UpdateSuggestions(BrowserWindow& win, bool allowCompletion) {
     ::SendMessageW(win.suggestList, LB_SETCURSEL, 0, 0);
     PositionSuggestions(win);
     win.suggestVisible = true;
+    // The rows are other rows now: no × is held down, and the one lit is the one the mouse
+    // is over, if it is over one.
+    EndRemovePress(win);
+    win.suggestRemoveHot = -1;
+    SetHotRemove(win, RemoveRowUnderMouse(win));
     if (!win.inlineText.empty()) ShowUserText(win);
+}
+
+// Forgets a row of the list: the pages behind it go out of the history, on disk as well,
+// and the list is made again without them. What was typed stays as it was typed.
+void ForgetSuggestion(BrowserWindow& win, int row) {
+    if (row < 0 || row >= static_cast<int>(win.suggestions.size())) return;
+    for (const std::wstring& url : PagesBehind(g_app.history.entries(), win.suggestions[row])) {
+        g_app.history.Remove(url);
+    }
+    SaveHistorySoon(true); // on disk at once: they were taken out to be gone
+    UpdateSuggestions(win, false);
+    // A completion, or a row that was being tried out, is no longer in the address bar.
+    if (UrlBoxText(win) != win.userText) ShowUserText(win);
 }
 
 // Up and Down go round the list, showing each row in the address bar on the way.
@@ -154,19 +231,46 @@ void NavigateTo(BrowserWindow& win, const std::wstring& url, bool typed) {
 }
 
 LRESULT CALLBACK SuggestListProc(HWND list, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR) {
+    BrowserWindow* const win = WindowFromChild(list);
     switch (msg) {
     // The list never takes the keyboard from the address bar, which a list box does
-    // when left to handle a click itself. A click picks the row under it and goes there.
+    // when left to handle a click itself. A click picks the row under it and goes there,
+    // unless it is on the row's ×, which forgets the row.
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK:
     case WM_LBUTTONUP: {
-        BrowserWindow* const win = WindowFromChild(list);
+        if (!win) return 0;
+        const int remove = RemoveRowAt(*win, {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+        const int pressed = win->suggestRemovePressed;
+        EndRemovePress(*win);
+        if (msg != WM_LBUTTONUP && remove >= 0) {
+            // Lit already as a rule, but not if the row came under a mouse that hasn't moved since.
+            SetHotRemove(*win, remove);
+            win->suggestRemovePressed = remove;
+            ::SetCapture(list);
+            RepaintSuggestion(*win, remove);
+            return 0;
+        }
+        if (msg == WM_LBUTTONUP && pressed >= 0) {
+            // Let go anywhere but on the × it went down on, nothing happens.
+            if (remove == pressed) ForgetSuggestion(*win, pressed);
+            return 0;
+        }
         const LRESULT hit = ::SendMessageW(list, LB_ITEMFROMPOINT, 0, lParam);
-        if (!win || HIWORD(hit)) return 0; // outside the rows
+        if (HIWORD(hit)) return 0; // outside the rows
         ::SendMessageW(list, LB_SETCURSEL, LOWORD(hit), 0);
         if (msg == WM_LBUTTONUP) NavigateFromUrlBox(*win);
         return 0;
     }
+    case WM_MOUSEMOVE:
+        if (win) SetHotRemove(*win, RemoveRowAt(*win, {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}));
+        break;
+    case WM_MOUSELEAVE:
+        if (win) SetHotRemove(*win, -1);
+        break;
+    case WM_CAPTURECHANGED:
+        if (win) EndRemovePress(*win);
+        break;
     case WM_NCDESTROY:
         ::RemoveWindowSubclass(list, SuggestListProc, subclassId);
         break;
@@ -401,6 +505,8 @@ void UpdateReloadButton(BrowserWindow& win) {
 }
 
 void HideSuggestions(BrowserWindow& win) {
+    EndRemovePress(win);
+    win.suggestRemoveHot = -1;
     if (win.suggestList) ::ShowWindow(win.suggestList, SW_HIDE);
     win.suggestVisible = false;
     win.inlineText.clear();

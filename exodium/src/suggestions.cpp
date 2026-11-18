@@ -4,6 +4,7 @@
 #include "url_util.h"
 
 #include <algorithm>
+#include <array>
 #include <cwctype>
 #include <functional>
 #include <iterator>
@@ -42,6 +43,7 @@ struct Match {
     std::wstring_view shown; // and its address as the list shows it
     int query = -1;          // or the words of a past search, by their place in Candidates::queries
     bool bookmarked = false;
+    HistoryBehind behind = HistoryBehind::kNothing;
 
     [[nodiscard]] bool search() const noexcept { return query >= 0; }
 };
@@ -78,12 +80,18 @@ int MatchWeight(std::wstring_view text, std::wstring_view term) noexcept {
     return best;
 }
 
+// Where an address may be read from: past its scheme and "www.", past its scheme alone,
+// or from its very start.
+[[nodiscard]] std::array<std::size_t, 3> StartsOf(const UrlSpan& span) noexcept {
+    return {span.bare, span.www, 0};
+}
+
 // Does the page's address begin with `typed`? Its scheme and "www." may be left out,
 // and only count as typed once the typing has gone past them.
 void ConsiderAsCompletion(Candidates& found, const Page& page, const UrlSpan& span, bool searched,
                           std::wstring_view typed) {
     const std::wstring_view url = page.url;
-    for (const std::size_t from : {span.bare, span.www, std::size_t{0}}) {
+    for (const std::size_t from : StartsOf(span)) {
         if (typed.size() <= span.bare - from || !StartsWithIgnoreCase(url.substr(from), typed)) continue;
 
         if (span.web && from + typed.size() <= span.hostEnd) {
@@ -97,6 +105,7 @@ void ConsiderAsCompletion(Candidates& found, const Page& page, const UrlSpan& sp
             }
             Suggestion& host = found.hosts[at->second];
             host.score += page.worth;
+            if (!page.bookmarked) host.behind = HistoryBehind::kSite;
             if (url.size() <= span.hostEnd + 1) { // its front page itself
                 host.url = url;
                 host.title = page.title;
@@ -104,12 +113,19 @@ void ConsiderAsCompletion(Candidates& found, const Page& page, const UrlSpan& sp
             }
         } else if (!searched) {
             const double score = url.size() - from == typed.size() ? kExactAddressScore : page.worth;
-            if (score > found.top.score) {
+            if (EqualsIgnoreCase(found.top.url, url)) {
+                // In the history and a bookmark too: the one page, with its star, the history
+                // behind it, and the better of the two scores.
+                found.top.bookmarked = found.top.bookmarked || page.bookmarked;
+                if (!page.bookmarked) found.top.behind = HistoryBehind::kPage;
+                found.top.score = std::max(found.top.score, score);
+            } else if (score > found.top.score) {
                 found.top = {.text = std::wstring(url.substr(from)),
                              .title = std::wstring(page.title),
                              .url = std::wstring(url),
                              .search = false,
                              .bookmarked = page.bookmarked,
+                             .behind = page.bookmarked ? HistoryBehind::kNothing : HistoryBehind::kPage,
                              .score = score};
             }
         }
@@ -135,7 +151,10 @@ void ConsiderAsWordMatch(Candidates& found, const Page& page, const UrlSpan& spa
     const double score = page.worth * fit / static_cast<double>(terms.size());
     const std::size_t place = found.rows.size();
     if (query) {
-        found.rows.push_back({.score = score, .found = place, .query = static_cast<int>(found.queries.size())});
+        found.rows.push_back({.score = score,
+                              .found = place,
+                              .query = static_cast<int>(found.queries.size()),
+                              .behind = page.bookmarked ? HistoryBehind::kNothing : HistoryBehind::kSearch});
         found.queries.push_back(std::move(*query));
     } else {
         found.rows.push_back({.score = score,
@@ -143,7 +162,8 @@ void ConsiderAsWordMatch(Candidates& found, const Page& page, const UrlSpan& spa
                               .url = page.url,
                               .title = page.title,
                               .shown = shown,
-                              .bookmarked = page.bookmarked});
+                              .bookmarked = page.bookmarked,
+                              .behind = page.bookmarked ? HistoryBehind::kNothing : HistoryBehind::kPage});
     }
 }
 
@@ -155,16 +175,25 @@ void Consider(Candidates& found, const Page& page, std::wstring_view typed, std:
 }
 
 // Puts one thing the typed words turned up in the list, unless it is there already, by
-// its address or by what it shows.
+// its address or by what it shows. A row that is there already for the same search or the
+// same page has behind it what this one has, if it had nothing: the typed text itself, when
+// it is a search made before, and a bookmark that is in the history too.
 void ListMatch(SuggestionList& list, const Match& match, const std::vector<std::wstring>& queries) {
+    const auto alsoBehind = [&match](Suggestion& listed) {
+        if (listed.behind == HistoryBehind::kNothing) listed.behind = match.behind;
+    };
     if (match.search()) {
         const std::wstring& words = queries[static_cast<std::size_t>(match.query)];
         const auto sameWords = [&words](const Suggestion& s) { return s.search && EqualsIgnoreCase(s.text, words); };
-        if (std::ranges::any_of(list.rows, sameWords)) return;
+        if (const auto listed = std::ranges::find_if(list.rows, sameWords); listed != list.rows.end()) {
+            alsoBehind(*listed);
+            return;
+        }
         std::wstring url = BuildSearchUrl(words);
         const auto sameUrl = [&url](const Suggestion& s) { return EqualsIgnoreCase(s.url, url); };
         if (std::ranges::any_of(list.rows, sameUrl)) return;
-        list.rows.push_back({.text = words, .url = std::move(url), .search = true, .score = match.score});
+        list.rows.push_back(
+            {.text = words, .url = std::move(url), .search = true, .behind = match.behind, .score = match.score});
         return;
     }
     const auto samePage = [&match](const Suggestion& s) {
@@ -172,13 +201,17 @@ void ListMatch(SuggestionList& list, const Match& match, const std::vector<std::
     };
     if (const auto listed = std::ranges::find_if(list.rows, samePage); listed != list.rows.end()) {
         // A page that is in the history and a bookmark is listed once, with its star.
-        if (match.bookmarked && EqualsIgnoreCase(listed->url, match.url)) listed->bookmarked = true;
+        if (EqualsIgnoreCase(listed->url, match.url)) {
+            listed->bookmarked = listed->bookmarked || match.bookmarked;
+            alsoBehind(*listed);
+        }
         return;
     }
     list.rows.push_back({.text = std::wstring(match.shown),
                          .title = std::wstring(match.title),
                          .url = std::wstring(match.url),
                          .bookmarked = match.bookmarked,
+                         .behind = match.behind,
                          .score = match.score});
 }
 
@@ -242,6 +275,37 @@ SuggestionList BuildSuggestions(std::span<const HistoryEntry> history, std::wstr
 
     ListMatches(list, found);
     return list;
+}
+
+std::vector<std::wstring> PagesBehind(std::span<const HistoryEntry> history, const Suggestion& row) {
+    std::vector<std::wstring> pages;
+    if (row.behind == HistoryBehind::kNothing) return pages;
+    for (const HistoryEntry& entry : history) {
+        const std::wstring_view url = entry.url;
+        const UrlSpan span = SpanOf(url);
+        bool behind = false;
+        switch (row.behind) {
+        case HistoryBehind::kNothing:
+            break;
+        case HistoryBehind::kPage:
+            behind = EqualsIgnoreCase(url, row.url);
+            break;
+        case HistoryBehind::kSite:
+            // The site as the row names it, which is as the typing had it: by its name
+            // alone, with its "www.", or with its scheme too.
+            behind = span.web && std::ranges::any_of(StartsOf(span), [&](std::size_t from) {
+                         return EqualsIgnoreCase(url.substr(from, span.hostEnd - from), row.text);
+                     });
+            break;
+        case HistoryBehind::kSearch:
+            if (const std::optional<std::wstring> query = SearchPageQuery(url, span)) {
+                behind = EqualsIgnoreCase(*query, row.text);
+            }
+            break;
+        }
+        if (behind) pages.emplace_back(url);
+    }
+    return pages;
 }
 
 } // namespace exodium

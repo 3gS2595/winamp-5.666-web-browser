@@ -68,9 +68,18 @@ bool OnCommand(BrowserWindow& win, int id, int code) {
         }
     }
 
+    // A second click on the zoom's − or + soon after the first is a double click to the
+    // button, which says so in place of a click. It is a step like the first.
+    if (code == BN_DBLCLK && (id == kIdZoomOut || id == kIdZoomIn)) code = BN_CLICKED;
+
     if (code == BN_CLICKED) {
         Tab* const tab = ActiveTab(win);
         ICoreWebView2* const webview = tab ? tab->webview.Get() : nullptr;
+        // A click takes the keyboard to the button clicked. The star and the zoom's buttons
+        // have no use for it, and give it back to the page.
+        const auto backToPage = [tab] {
+            if (tab && tab->controller) MoveFocusToWebView(*tab);
+        };
         switch (id) {
         case kIdBack:
         case kIdForward:
@@ -86,8 +95,16 @@ bool OnCommand(BrowserWindow& win, int id, int code) {
             return true;
         case kIdBookmark:
             ToggleBookmark(win);
-            // The click took the keyboard to the star, which has no use for it.
-            if (tab && tab->controller) MoveFocusToWebView(*tab);
+            backToPage();
+            return true;
+        case kIdZoomOut:
+        case kIdZoomIn:
+            StepSiteZoom(win, id == kIdZoomIn);
+            backToPage();
+            return true;
+        case kIdZoomLevel:
+            ResetSiteZoom(win);
+            backToPage();
             return true;
         case kIdNewTab:
             NewTab(win);

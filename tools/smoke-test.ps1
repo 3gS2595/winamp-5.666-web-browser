@@ -2219,13 +2219,174 @@ public static class PageShot {
 }
 "@
     }
-    $fr = New-Object W+RECT; [void][W]::GetWindowRect($frame, [ref]$fr)
-    $shot = New-Object System.Drawing.Bitmap ($fr.R - $fr.L), ($fr.B - $fr.T), ([System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
-    $graphics = [System.Drawing.Graphics]::FromImage($shot)
-    $dc = $graphics.GetHdc(); [void][PageShot]::PrintWindow($frame, $dc, 2); $graphics.ReleaseHdc($dc); $graphics.Dispose()
-    $shotPath = Join-Path $ScratchDir "browser-window.png"
-    $shot.Save($shotPath, [System.Drawing.Imaging.ImageFormat]::Png); $shot.Dispose()
-    "  info  the browser window: $shotPath"
+    $shootFrame = { param([string]$name)
+        $fr = New-Object W+RECT; [void][W]::GetWindowRect($frame, [ref]$fr)
+        $shot = New-Object System.Drawing.Bitmap ($fr.R - $fr.L), ($fr.B - $fr.T), ([System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+        $graphics = [System.Drawing.Graphics]::FromImage($shot)
+        $dc = $graphics.GetHdc(); [void][PageShot]::PrintWindow($frame, $dc, 2); $graphics.ReleaseHdc($dc); $graphics.Dispose()
+        $shotPath = Join-Path $ScratchDir $name
+        $shot.Save($shotPath, [System.Drawing.Imaging.ImageFormat]::Png); $shot.Dispose()
+        $shotPath
+    }
+    "  info  the browser window: $(& $shootFrame "browser-window.png")"
+
+    # A site of the test's own, on this computer, for what goes by a page's site: a file has
+    # none. Every address on it is a page, which says in its title how large it is drawn, in
+    # hundredths of a device pixel to the pixel of its own.
+    if (-not ("TestSite" -as [type])) {
+        Add-Type @"
+using System; using System.Net; using System.Net.Sockets; using System.Text; using System.Threading;
+public static class TestSite {
+    static HttpListener listener;
+    // Starts it on a port that is free, and says which.
+    public static int Start() {
+        var probe = new TcpListener(IPAddress.Loopback, 0);
+        probe.Start();
+        int port = ((IPEndPoint)probe.LocalEndpoint).Port;
+        probe.Stop();
+        listener = new HttpListener();
+        listener.Prefixes.Add("http://localhost:" + port + "/");
+        listener.Start();
+        var serving = listener;
+        var thread = new Thread(() => {
+            try {
+                while (true) {
+                    var context = serving.GetContext();
+                    string name = context.Request.Url.AbsolutePath.Trim('/');
+                    byte[] body = Encoding.ASCII.GetBytes("<!doctype html><title>Site " + name + "</title><p>" + name + "</p>" +
+                        "<script>setInterval(() => { document.title = 'Site " + name + " ' + Math.round(devicePixelRatio * 100) }, 100)</script>");
+                    context.Response.ContentType = "text/html";
+                    context.Response.OutputStream.Write(body, 0, body.Length);
+                    context.Response.Close();
+                }
+            } catch (Exception) { }  // stopped
+        });
+        thread.IsBackground = true;
+        thread.Start();
+        return port;
+    }
+    public static void Stop() { if (listener != null) { listener.Close(); listener = null; } }
+}
+"@
+    }
+    $sitePort = [TestSite]::Start()
+    $site = "http://localhost:$sitePort"
+    try {
+        $onSitePage = { param([string]$name) WaitFor { [W]::Title($frame) -match "^Site $name \d+$" } 20 }
+        & $newTab
+        foreach ($name in "alpha", "beta") { Navigate $client "$site/$name"; [void](& $onSitePage $name) }
+        Check ([W]::Title($frame) -like "Site beta *" -and (& $urlBar) -eq "$site/beta") "two pages visited on a site of the test's own: '$([W]::Title($frame))' '$(& $urlBar)'"
+
+        # The x at the end of a row of the address bar's list forgets the row: the pages the
+        # history has behind it go, and it isn't suggested again until one is visited again.
+        # The list draws its rows itself, so what they are is told by how many there are and
+        # by what goes out of the history.
+        $list = Control $client 1200
+        $rows = { if ([W]::IsWindowVisible($list)) { [int][W]::SendMessageP($list, 0x018B, [IntPtr]::Zero, [IntPtr]::Zero) } else { 0 } }  # LB_GETCOUNT
+        $typeInBar = { param([string]$text)
+            & $key 0x44 @(0x12)  # Alt+D
+            [void](WaitFor { [W]::Focus($client) -eq $addressBar } 5)
+            [void][W]::SendMessage($addressBar, 0x000C, [IntPtr]::Zero, $text)  # WM_SETTEXT, which the address bar takes as typing
+            Start-Sleep -Milliseconds 300
+        }
+        # A point in a row of the list: on the x, a square of 16 pixels 6 in from the row's
+        # right end, or on the row's text.
+        $rowPoint = { param([int]$row, [bool]$onRemove)
+            $r = New-Object W+RECT; [void][W]::GetWindowRect($list, [ref]$r)
+            $rowHeight = [int][W]::SendMessageP($list, 0x01A1, [IntPtr]::Zero, [IntPtr]::Zero)  # LB_GETITEMHEIGHT
+            $x = if ($onRemove) { ($r.R - $r.L - 2) - 6 - 8 } else { 40 }
+            LParam $x ($row * $rowHeight + [int]($rowHeight / 2))
+        }
+        $pressRow = { param($at) [void][W]::PostMessage($list, 0x0201, [IntPtr]1, $at) }                                  # WM_LBUTTONDOWN
+        $letGoOfRow = { param($at) [void][W]::PostMessage($list, 0x0202, [IntPtr]0, $at); Start-Sleep -Milliseconds 400 }  # WM_LBUTTONUP
+        $forgotten = { param([string]$name) & $journalHas "R`t$site/$name" }  # the journal's line for an entry removed
+
+        & $typeInBar "localh"
+        Check ((& $rows) -eq 4) "typing the start of the site's name lists the typed text, the site and its two pages: $(& $rows) rows"
+        "  info  the address bar's list: $(& $shootFrame "address-bar-list.png")"
+        & $pressRow (& $rowPoint 2 $true); & $letGoOfRow (& $rowPoint 2 $true)
+        Check ((WaitFor { (& $rows) -eq 3 } 5) -and (& $forgotten "beta") -and -not (& $forgotten "alpha")) "the x on the page visited last forgets that page alone, in the history's journal at once: $(& $rows) rows"
+        Check ([W]::Focus($client) -eq $addressBar -and (& $urlBar) -eq "localh") "with the keyboard and the typed text still in the address bar: '$(& $urlBar)'"
+        & $pressRow (& $rowPoint 2 $true); & $letGoOfRow (& $rowPoint 2 $false)
+        Start-Sleep -Milliseconds 500
+        Check ((& $rows) -eq 3 -and -not (& $forgotten "alpha") -and [W]::Title($frame) -like "Site beta *") "an x pressed and let go of elsewhere on its row forgets nothing, and goes nowhere: $(& $rows) rows, '$([W]::Title($frame))'"
+        & $pressRow (& $rowPoint 1 $true); & $letGoOfRow (& $rowPoint 1 $true)
+        Check ((WaitFor { (& $rows) -eq 1 } 5) -and (& $forgotten "alpha")) "the x on the site forgets every page on it, which leaves the typed text alone: $(& $rows) row"
+
+        foreach ($name in "alpha", "gamma") { Navigate $client "$site/$name"; [void](& $onSitePage $name) }
+        & $typeInBar "localh"
+        Check ((& $rows) -eq 4) "visited again, the site and its pages are suggested again: $(& $rows) rows"
+        & $pressRow (& $rowPoint 3 $false); & $letGoOfRow (& $rowPoint 3 $false)
+        Check ((& $onSitePage "alpha") -and (& $urlBar) -eq "$site/alpha") "and a click on a row's text still goes to its page: '$([W]::Title($frame))' '$(& $urlBar)'"
+
+        # The page's zoom on the toolbar: nothing at 100%, and otherwise the percentage
+        # between a - and a +, left of the star, with the address bar making room.
+        $zoomOut = Control $client 1010; $zoomLevel = Control $client 1011; $zoomIn = Control $client 1012
+        $zoomParts = @($zoomOut, $zoomLevel, $zoomIn)
+        $zoomShown = { @($zoomParts | Where-Object { [W]::IsWindowVisible($_) }).Count }
+        $left = { param($control) $r = New-Object W+RECT; [void][W]::GetWindowRect($control, [ref]$r); $r.L }
+        $right = { param($control) $r = New-Object W+RECT; [void][W]::GetWindowRect($control, [ref]$r); $r.R }
+        $barWidth = { (& $right $addressBar) - (& $left $addressBar) }
+        $drawnAt = { if ([W]::Title($frame) -match ' (\d+)$') { [int]$Matches[1] } else { 0 } }
+        $drawnAtTimes = { param([double]$factor) WaitFor { [math]::Abs((& $drawnAt) - $factor * $drawnNormal) -le 2 } 10 }
+        $zoomFile = "$wa\Plugins\exodium_data\zoom.txt"
+        $zoomKept = { if (Test-Path $zoomFile) { @([IO.File]::ReadAllLines($zoomFile) | Where-Object { $_ -like "localhost:$sitePort`t*" }) -join " " } else { "" } }
+        $zoomSays = { param([string]$percent) WaitFor { [W]::Text($zoomLevel) -eq $percent -and (& $zoomShown) -eq 3 } 5 }
+        $click = { param($button) PostClick $button 5 5; Start-Sleep -Milliseconds 400 }
+
+        $drawnNormal = & $drawnAt
+        $widthNormal = & $barWidth
+        Check ($zoomOut -ne [IntPtr]::Zero -and $zoomLevel -ne [IntPtr]::Zero -and $zoomIn -ne [IntPtr]::Zero -and (& $zoomShown) -eq 0 -and $drawnNormal -gt 0) "at 100% the toolbar says nothing of the zoom: $(& $zoomShown) of its three buttons showing, the page drawn at $drawnNormal"
+        [void][W]::SendMessageP($client, 0x0111, [IntPtr]1012, $zoomIn)  # WM_COMMAND, as a click on the + sends it
+        Check (& $zoomSays "110%") "zoomed in a step, it says 110% between a - and a +: '$([W]::Text($zoomLevel))', $(& $zoomShown) showing"
+        Check ([W]::Text($zoomOut) -eq [string][char]0x2212 -and [W]::Text($zoomIn) -eq "+") "which are a minus sign and a plus"
+        $star = Control $client 1009
+        Check ((& $right $addressBar) -lt (& $left $zoomOut) -and (& $right $zoomOut) -le (& $left $zoomLevel) + 1 -and (& $right $zoomLevel) -le (& $left $zoomIn) + 1 -and (& $right $zoomIn) -lt (& $left $star)) "they are between the address bar and the star, side by side"
+        Check ((& $barWidth) -eq $widthNormal - 92) "and the address bar has made room for them: $(& $barWidth) wide, from $widthNormal"
+        Check (& $drawnAtTimes 1.1) "the page is drawn a tenth larger: $(& $drawnAt), from $drawnNormal"
+        Check ((& $zoomKept) -eq "localhost:$sitePort`t1.1000") "and its site's zoom is in zoom.txt: '$(& $zoomKept)'"
+        & $click $zoomIn
+        Check (& $zoomSays "125%") "a click on the + is the next step up: '$([W]::Text($zoomLevel))'"
+        # A second click soon after the first is a double click to a button.
+        [void][W]::PostMessage($zoomIn, 0x0203, [IntPtr]1, (LParam 5 5))  # WM_LBUTTONDBLCLK
+        [void][W]::PostMessage($zoomIn, 0x0202, [IntPtr]0, (LParam 5 5))  # WM_LBUTTONUP
+        Check ((& $zoomSays "150%") -and (& $drawnAtTimes 1.5)) "and so is a second click right after it: '$([W]::Text($zoomLevel))', drawn at $(& $drawnAt)"
+        Check ([W]::Class([W]::Focus($client)) -ne "Button") "the keyboard isn't left on the button: $([W]::Class([W]::Focus($client)))"
+        "  info  the zoom on the toolbar: $(& $shootFrame "zoom-buttons.png")"
+
+        & $newTab
+        Check ((& $zoomShown) -eq 0 -and (& $barWidth) -eq $widthNormal) "a tab on another site, at 100%, has none of them, and the whole address bar: $(& $zoomShown) showing"
+        Navigate $client "$site/delta"; [void](& $onSitePage "delta")
+        Check ((& $zoomSays "150%") -and (& $drawnAtTimes 1.5)) "gone to the zoomed site, it is zoomed as the site is, and says so: '$([W]::Text($zoomLevel))', drawn at $(& $drawnAt)"
+        & $click $zoomOut
+        Check ((& $zoomSays "125%") -and (& $zoomKept) -eq "localhost:$sitePort`t1.2500") "a click on the - is a step down, for the site: '$([W]::Text($zoomLevel))' '$(& $zoomKept)'"
+        ClickTab @(TabButtons $client | Where-Object { [W]::Text($_) -like "Site alpha *" })[0]
+        Check ((& $zoomSays "125%") -and (& $drawnAtTimes 1.25)) "the site's other tab followed: '$([W]::Text($zoomLevel))', drawn at $(& $drawnAt)"
+
+        # A window too narrow for them and the address bar both goes without them.
+        $fr = New-Object W+RECT; [void][W]::GetWindowRect($frame, [ref]$fr)
+        [void][W]::SetWindowPos($frame, [IntPtr]::Zero, 0, 0, 300, ($fr.B - $fr.T), 0x16)  # SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
+        Check ((WaitFor { (& $zoomShown) -eq 0 } 5) -and (& $barWidth) -ge 40) "in a window 300 wide they give way to the address bar: $(& $zoomShown) showing, the address bar $(& $barWidth) wide"
+        [void][W]::SetWindowPos($frame, [IntPtr]::Zero, 0, 0, ($fr.R - $fr.L), ($fr.B - $fr.T), 0x16)
+        Check ((WaitFor { (& $zoomShown) -eq 3 } 5) -and (& $barWidth) -eq $widthNormal - 92) "and are back when it is wide again: $(& $zoomShown) showing"
+
+        & $click $zoomLevel
+        Check ((WaitFor { (& $zoomShown) -eq 0 } 5) -and (& $barWidth) -eq $widthNormal -and (& $drawnAtTimes 1)) "a click on the percentage puts the page back to 100%, and they go: $(& $zoomShown) showing, drawn at $(& $drawnAt)"
+        Check ((& $zoomKept) -eq "") "with nothing kept for the site: '$(& $zoomKept)'"
+        [void][W]::SendMessageP($client, 0x0111, [IntPtr]1010, $zoomOut)
+        Check ((& $zoomSays "90%") -and (& $drawnAtTimes 0.9)) "zoomed out a step from there, it says 90%: '$([W]::Text($zoomLevel))', drawn at $(& $drawnAt)"
+        & $key 0x30 @($VK_CONTROL)  # Ctrl+0
+        Check ((WaitFor { (& $zoomShown) -eq 0 } 5) -and (& $drawnAtTimes 1)) "and Ctrl+0 takes them away again: $(& $zoomShown) showing"
+
+        # The two tabs go again, which leaves the window as it was.
+        foreach ($name in "delta", "alpha") {
+            & $tabCommand @(TabButtons $client | Where-Object { [W]::Text($_) -like "Site $name *" })[0] 5  # TabCommand::kClose
+            [void](WaitFor { -not @(TabTexts $client | Where-Object { $_ -like "Site $name *" }).Count } 10)
+        }
+        Check (-not @(TabTexts $client | Where-Object { $_ -like "Site *" }).Count) "the site's tabs close again: '$((TabTexts $client) -join "' | '")'"
+    } finally {
+        [TestSite]::Stop()
+    }
 
     Check (-not $p.HasExited) "Winamp is still running"
 }
@@ -2251,6 +2412,11 @@ if (Test-Path $history) {
     Check ($bf0.Count -eq 1 -and $bf0[0].Split("`t")[1] -eq "1") "a page copied into other tabs' history counts only its own visit: $($bf0 -join ' ')"
     $newOne = @($lines | Where-Object { $_ -like "file:*/newOne.html`t*" })
     Check ($newOne.Count -eq 1 -and $newOne[0].Split("`t")[2] -eq "1" -and $newOne[0].Split("`t")[4] -eq "New One") "and has the page opened by its path, as an address typed in: $($newOne -join ' ')"
+    # Of the test's own site: beta was forgotten by the x on its row and not visited again;
+    # alpha was forgotten with the site after one visit, and visited twice more.
+    $siteVisits = @{}
+    foreach ($line in @($lines | Where-Object { $_ -like "$site/*" })) { $cols = $line.Split("`t"); $siteVisits[$cols[0].Substring($site.Length + 1)] = $cols[1] }
+    Check (-not $siteVisits.ContainsKey("beta") -and $siteVisits["alpha"] -eq "2") "a page forgotten from the address bar's list is out of the history, and one visited again counts the visits since: alpha $($siteVisits['alpha']), beta $($siteVisits['beta'])"
 } else { Check $false "history.txt was written at exit" }
 Check (-not (Test-Path "$wa\Plugins\exodium_data\history.journal")) "the history's journal is done with once the history is written whole at exit"
 $bookmarksFile = "$wa\Plugins\exodium_data\bookmarks.txt"

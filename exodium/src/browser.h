@@ -50,6 +50,11 @@ enum ControlId : int {
     kIdDownloads = 1007,
     kIdBitwarden = 1008,
     kIdBookmark = 1009, // the star at the address bar's right end
+    // The page's zoom, left of the star while it is anything but 100%: the percentage, between
+    // the button that makes the page smaller and the one that makes it larger.
+    kIdZoomOut = 1010,
+    kIdZoomLevel = 1011,
+    kIdZoomIn = 1012,
     kIdTabBar = 1100,
     kIdNewTab = 1101,
     kIdTabsLeft = 1102,
@@ -145,6 +150,8 @@ inline constexpr wchar_t kGlyphReload[] = L"\u21BA";     // anticlockwise open c
 inline constexpr wchar_t kGlyphStop[] = L"\u23F9";       // black square for stop
 inline constexpr wchar_t kGlyphBookmark[] = L"\u2606";   // a white star: the page in view isn't a bookmark
 inline constexpr wchar_t kGlyphBookmarked[] = L"\u2605"; // a black star: it is
+inline constexpr wchar_t kGlyphZoomOut[] = L"\u2212";    // a minus sign, as wide as the plus on the button beside it
+inline constexpr wchar_t kGlyphZoomIn[] = L"+";
 
 // ---- colours and shared GDI objects ----
 
@@ -414,6 +421,11 @@ struct BrowserWindow {
     HWND backButton = nullptr, forwardButton = nullptr, reloadButton = nullptr, closeTabButton = nullptr;
     HWND urlEdit = nullptr;
     HWND bookmarkButton = nullptr; // the star, right of the address bar
+    // The zoom of the page in view, between the address bar and the star while it is anything
+    // but 100%: the percentage, which puts the page back to 100% when clicked, with a button
+    // on its left that makes the page smaller and one on its right that makes it larger.
+    // See zoom.cpp.
+    HWND zoomOutButton = nullptr, zoomLevelButton = nullptr, zoomInButton = nullptr;
     // What a tab says when the mouse rests on it: its page's whole title and its site, which
     // a narrow tab has no room for. See tab_menu.cpp.
     HWND tabTips = nullptr;
@@ -425,6 +437,11 @@ struct BrowserWindow {
     std::wstring userText;               // the address bar's text as typed, with nothing suggested in it
     std::wstring inlineText;             // the completion shown selected after userText, if any
     bool typingChar = false;             // the address bar is taking a typed character right now
+    // The × at the end of a row the history is behind, which forgets the row: the row whose
+    // × the mouse is over, and the one whose × it went down on and has yet to let go of; -1
+    // for none.
+    int suggestRemoveHot = -1;
+    int suggestRemovePressed = -1;
 
     bool editDirty = false;      // the address bar holds text the user is working on
     bool settingUrl = false;     // the address bar's text is being set by us, not typed
@@ -820,6 +837,9 @@ void DrawOwnerButton(const DRAWITEMSTRUCT& item, const Tab* tab, const ButtonLoo
 // Draws the star that bookmarks the page in view: filled when it is a bookmark.
 void DrawBookmarkButton(const DRAWITEMSTRUCT& item, bool marked);
 void DrawSuggestion(const BrowserWindow& win, const DRAWITEMSTRUCT& item);
+// Where the × that forgets a row of the suggestion list is, given the row's place in the
+// list: at its right end. Only a row the history is behind has one.
+[[nodiscard]] RECT SuggestionRemoveBox(const RECT& row) noexcept;
 
 // ---- layout (layout.cpp) ----
 
@@ -1066,6 +1086,14 @@ void ApplySiteZoom(Tab& tab);
 // The user zoomed the page in a tab.
 void SetSiteZoom(Tab& tab, double factor);
 void ResetSiteZoom(BrowserWindow& win);
+// The − and + on the toolbar: zooms the page in view to the next size down, or up
+// (`larger`), of the sizes Ctrl with − and + go through.
+void StepSiteZoom(BrowserWindow& win, bool larger);
+// A tab's webview has gone, and its zoom with it: the next one starts out at 100%.
+void ForgetTabZoom(Tab& tab);
+// Has the toolbar say what the page in view is zoomed to, between its − and +, or nothing
+// while that is 100%. The address bar gives them their room and takes it back.
+void UpdateZoomButtons(BrowserWindow& win);
 
 // ---- the windows and tabs kept from one run of Winamp to the next (session.cpp) ----
 

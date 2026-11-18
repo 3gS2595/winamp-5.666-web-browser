@@ -12,6 +12,10 @@ namespace {
 constexpr int kFactorDecimals = 4;
 constexpr long long kFactorScale = 10'000;
 
+// The sizes NextZoomStep goes through, smallest first.
+constexpr double kZoomSteps[] = {SiteZoom::kMin, 1 / 3.0, 0.5,  2 / 3.0, 0.75, 0.8, 0.9, SiteZoom::kNormal, 1.1,
+                                 1.25,           1.5,     1.75, 2.0,     2.5,  3.0, 4.0, SiteZoom::kMax};
+
 // A factor to four decimal places, as "1.2500".
 std::wstring FormatFactor(double factor) {
     const long long scaled = std::llround(factor * kFactorScale);
@@ -66,6 +70,19 @@ void SiteZoom::Load(const std::filesystem::path& file) {
 
 bool SiteZoom::Save(const std::filesystem::path& file) const {
     return WriteTextFile(file, Serialize());
+}
+
+double NextZoomStep(double factor, bool larger) noexcept {
+    if (larger) {
+        for (const double step : kZoomSteps) {
+            if (step > factor + kZoomTolerance) return step;
+        }
+        return SiteZoom::kMax;
+    }
+    for (const double step : kZoomSteps | std::views::reverse) {
+        if (step < factor - kZoomTolerance) return step;
+    }
+    return SiteZoom::kMin;
 }
 
 } // namespace exodium

@@ -36,4 +36,11 @@ private:
     std::map<std::wstring, double, std::less<>> factors_;
 };
 
+// The size after `factor`, or before it, among the sizes a page is zoomed through a step at
+// a time: 25, 33, 50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400 and 500%,
+// which are Chrome's, and the ones the webview goes through for Ctrl with + and −. A factor
+// between two of them goes to the nearer one in that direction, and the ends stay where
+// they are.
+[[nodiscard]] double NextZoomStep(double factor, bool larger) noexcept;
+
 } // namespace exodium

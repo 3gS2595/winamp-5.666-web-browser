@@ -185,6 +185,12 @@ void DrawBookmarkButton(const DRAWITEMSTRUCT& item, bool marked) {
     ::BitBlt(item.hDC, rect.left, rect.top, Width(rect), Height(rect), dc, rect.left, rect.top, SRCCOPY);
 }
 
+RECT SuggestionRemoveBox(const RECT& row) noexcept {
+    const int right = row.right - kSuggestionPadding;
+    const int top = row.top + (Height(row) - kIconSize) / 2;
+    return {right - kIconSize, top, right, top + kIconSize};
+}
+
 void DrawSuggestion(const BrowserWindow& win, const DRAWITEMSTRUCT& item) {
     if (item.itemID >= win.suggestions.size()) return; // an empty list asks for item -1
     const Suggestion& suggestion = win.suggestions[item.itemID];
@@ -193,6 +199,19 @@ void DrawSuggestion(const BrowserWindow& win, const DRAWITEMSTRUCT& item) {
 
     const Theme& theme = g_app.theme;
     ::FillRect(dc, &rect, ((item.itemState & ODS_SELECTED) ? theme.suggestSelected : theme.panel).get());
+
+    // A row the history is behind ends in the × that forgets it, which is a tab's close
+    // button over again: lit under the mouse, and lighter while held down with the mouse
+    // on it. The text stops short of it.
+    if (suggestion.behind != HistoryBehind::kNothing) {
+        const RECT box = SuggestionRemoveBox(rect);
+        const int row = static_cast<int>(item.itemID);
+        const bool pressed = win.suggestRemovePressed == row;
+        const bool over = win.suggestRemoveHot == row;
+        DrawCloseButton(dc, {box.left, box.top, box.right, box.bottom}, over && win.suggestRemovePressed < 0,
+                        over && pressed);
+        rect.right = box.left;
+    }
 
     // A page reads "Title - address" and a search "words - Google Search", or whichever
     // engine is in use. An address whose title isn't known stands alone.

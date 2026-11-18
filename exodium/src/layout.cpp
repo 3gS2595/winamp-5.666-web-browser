@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <initializer_list>
+#include <utility>
 
 namespace exodium {
 
@@ -15,6 +16,10 @@ constexpr int kTabHeight = kTabBarHeight - 2;
 constexpr int kUrlReservedWidth = 160;
 constexpr int kToolbarButtonCount = 4;
 constexpr int kBookmarkButtonWidth = 28; // the star's; as wide as the downloads button
+constexpr int kZoomSignWidth = 22;       // the − and the + on either side of the page's zoom
+constexpr int kZoomLevelWidth = 44;      // and the percentage between them, up to "500%"
+// The three side by side, each sharing a border with the next.
+constexpr int kZoomButtonsWidth = 2 * kZoomSignWidth + kZoomLevelWidth - 2;
 
 [[nodiscard]] int TabCount(const BrowserWindow& win) noexcept {
     return static_cast<int>(win.tabs.size());
@@ -43,13 +48,31 @@ void ShowControl(HWND control, bool show) noexcept {
 
 // Lays out the buttons at the toolbar's right end. Two of them come and go: Bitwarden's,
 // while it is there, at the very end, and the downloads button, while there are downloads,
-// left of it. The star that bookmarks the page in view is always there, left of both and
-// right up against the address bar. Says where the address bar has to end.
-int LayoutToolbarEnd(BrowserWindow& win, int top, int height) {
+// left of it. The star that bookmarks the page in view is always there, left of both.
+// Left of the star, and right up against the address bar, is the page's zoom while that is
+// anything but 100%: −, the percentage and +. A window too narrow for them and the address
+// bar both, which begins at `left`, goes without them. Says where the address bar has to end.
+int LayoutToolbarEnd(BrowserWindow& win, int left, int top, int height) {
     int right = LayoutBitwardenButton(win, ClientRectOf(win.client).right - kMargin, top, height);
     right = LayoutDownloads(win, right, top, height);
     ::MoveWindow(win.bookmarkButton, right - kBookmarkButtonWidth, top, kBookmarkButtonWidth, height, TRUE);
-    return right - kBookmarkButtonWidth - kButtonGap;
+    right -= kBookmarkButtonWidth + kButtonGap;
+
+    const Tab* const tab = ActiveTab(win);
+    const bool zoomed = tab && !SameZoom(tab->zoom, SiteZoom::kNormal) && !win.isFullscreen &&
+                        right - kZoomButtonsWidth - kButtonGap - left >= kUrlMinWidth;
+    if (zoomed) {
+        int x = right - kZoomButtonsWidth;
+        for (const auto& [button, width] :
+             {std::pair{win.zoomOutButton, kZoomSignWidth}, std::pair{win.zoomLevelButton, kZoomLevelWidth},
+              std::pair{win.zoomInButton, kZoomSignWidth}}) {
+            ::MoveWindow(button, x, top, width, height, TRUE);
+            x += width - 1;
+        }
+        right -= kZoomButtonsWidth + kButtonGap;
+    }
+    for (const HWND button : {win.zoomOutButton, win.zoomLevelButton, win.zoomInButton}) ShowControl(button, zoomed);
+    return right;
 }
 
 // Where a window's tab strip begins and ends: clear of the ornaments on its corners.
@@ -75,6 +98,10 @@ void CreateControls(BrowserWindow& win) {
     win.reloadButton = CreateButton(win, kGlyphReload, kIdReload);
     win.closeTabButton = CreateButton(win, L"X", kIdCloseTab);
     CreateAddressBar(win);
+    // The zoom's three are only shown while the page in view is zoomed; see LayoutToolbarEnd.
+    win.zoomOutButton = CreateButton(win, kGlyphZoomOut, kIdZoomOut, 0);
+    win.zoomLevelButton = CreateButton(win, L"", kIdZoomLevel, 0);
+    win.zoomInButton = CreateButton(win, kGlyphZoomIn, kIdZoomIn, 0);
     win.bookmarkButton = CreateButton(win, kGlyphBookmark, kIdBookmark);
     CreateDownloadsControls(win);
     CreateBitwardenButton(win);
@@ -214,7 +241,7 @@ void LayoutToolbarAndTabs(BrowserWindow& win) {
         ::MoveWindow(button, x, y, buttonWidth, height, TRUE);
         x += buttonWidth + kButtonGap;
     }
-    const int urlRight = LayoutToolbarEnd(win, y, height);
+    const int urlRight = LayoutToolbarEnd(win, x, y, height);
     ::MoveWindow(win.urlEdit, x, y, std::max(kUrlMinWidth, urlRight - x), height, TRUE);
 
     HideSuggestions(win);
@@ -224,7 +251,7 @@ void LayoutToolbarAndTabs(BrowserWindow& win) {
 void FitAddressBar(BrowserWindow& win) {
     RECT edit = WindowRectOf(win.urlEdit);
     ::MapWindowPoints(nullptr, win.client, reinterpret_cast<POINT*>(&edit), 2);
-    const int right = LayoutToolbarEnd(win, edit.top, Height(edit));
+    const int right = LayoutToolbarEnd(win, edit.left, edit.top, Height(edit));
     ::MoveWindow(win.urlEdit, edit.left, edit.top, std::max(kUrlMinWidth, right - static_cast<int>(edit.left)),
                  Height(edit), TRUE);
 }
@@ -232,10 +259,13 @@ void FitAddressBar(BrowserWindow& win) {
 void SetToolbarControlsVisible(BrowserWindow& win, bool visible) {
     ShowControl(win.tabBar, visible);
     ShowControl(win.newTabButton, visible);
-    // Which tabs and scroll buttons a strip shows is up to LayoutTabStrip; here they only go.
+    // Which tabs and scroll buttons a strip shows is up to LayoutTabStrip, and whether the
+    // page's zoom shows to LayoutToolbarEnd; here they only go.
     if (!visible) {
-        ShowControl(win.tabsLeftButton, false);
-        ShowControl(win.tabsRightButton, false);
+        for (const HWND control :
+             {win.tabsLeftButton, win.tabsRightButton, win.zoomOutButton, win.zoomLevelButton, win.zoomInButton}) {
+            ShowControl(control, false);
+        }
     }
     for (const Tab& tab : win.tabs) ShowControl(tab.button.get(), visible);
     for (const HWND control :

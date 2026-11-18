@@ -263,3 +263,35 @@ TEST_CASE(ParsesZoomFilesAndDropsNonsense) {
     EXPECT(SameZoom(1.25, 1.2504));
     EXPECT(!SameZoom(1.25, 1.26));
 }
+
+TEST_CASE(ZoomGoesUpAndDownAStepAtATime) {
+    EXPECT_EQ(NextZoomStep(1.0, true), 1.1);
+    EXPECT_EQ(NextZoomStep(1.0, false), 0.9);
+    EXPECT_EQ(NextZoomStep(1.1, false), 1.0);
+    EXPECT_EQ(NextZoomStep(0.5, false), 1 / 3.0);
+
+    // From between two steps, where the wheel can leave a page, to the nearer one that way;
+    // and a factor that is a step for all that can be seen of it counts as that step.
+    EXPECT_EQ(NextZoomStep(1.2, true), 1.25);
+    EXPECT_EQ(NextZoomStep(1.2, false), 1.1);
+    EXPECT_EQ(NextZoomStep(1.2504, true), 1.5);
+    EXPECT_EQ(NextZoomStep(1.2504, false), 1.1);
+
+    // The ends stay where they are.
+    EXPECT_EQ(NextZoomStep(SiteZoom::kMax, true), SiteZoom::kMax);
+    EXPECT_EQ(NextZoomStep(SiteZoom::kMin, false), SiteZoom::kMin);
+
+    // All the way down from the largest: sixteen steps, with 100% among them, each of
+    // which the file keeps and reads back.
+    int steps = 0;
+    bool passedNormal = false;
+    for (double factor = SiteZoom::kMax; !SameZoom(factor, SiteZoom::kMin); ++steps) {
+        factor = NextZoomStep(factor, false);
+        passedNormal = passedNormal || SameZoom(factor, SiteZoom::kNormal);
+        SiteZoom zoom;
+        zoom.Set(L"a.example", factor);
+        EXPECT(SameZoom(SiteZoom::Parse(zoom.Serialize()).FactorFor(L"a.example"), factor));
+    }
+    EXPECT_EQ(steps, 16);
+    EXPECT(passedNormal);
+}

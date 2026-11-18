@@ -7,7 +7,15 @@
 // of a different size than it asked for, and screenshots in other pixels than the ones
 // it clicks in. A zoom set in one of them is that tab's alone, and lasts until its
 // page changes.
+//
+// While the page in view is at anything but 100%, the toolbar says so, left of the star:
+// the percentage, between a − that makes the page smaller and a + that makes it larger,
+// by the steps Ctrl with − and + take. A click on the percentage puts the page back to
+// 100%, as Ctrl+0 does. At 100% none of the three is there, and the address bar has
+// their room.
 #include "browser.h"
+
+#include <cmath>
 
 namespace exodium {
 
@@ -22,6 +30,7 @@ namespace {
 void SetTabZoom(Tab& tab, double factor) {
     tab.zoom = factor;
     if (tab.controller) tab.controller->put_ZoomFactor(factor);
+    if (const TabLocation at = FindTab(tab.id); at && at.isActive()) UpdateZoomButtons(*at.window);
 }
 
 } // namespace
@@ -51,6 +60,25 @@ void SetSiteZoom(Tab& tab, double factor) {
 
 void ResetSiteZoom(BrowserWindow& win) {
     if (Tab* tab = ActiveTab(win)) SetSiteZoom(*tab, SiteZoom::kNormal);
+}
+
+void StepSiteZoom(BrowserWindow& win, bool larger) {
+    if (Tab* const tab = ActiveTab(win)) SetSiteZoom(*tab, NextZoomStep(tab->zoom, larger));
+}
+
+void ForgetTabZoom(Tab& tab) {
+    SetTabZoom(tab, SiteZoom::kNormal);
+}
+
+void UpdateZoomButtons(BrowserWindow& win) {
+    if (!win.zoomLevelButton) return;
+    const Tab* const tab = ActiveTab(win);
+    const double factor = tab ? tab->zoom : SiteZoom::kNormal;
+    const std::wstring percent = std::to_wstring(std::lround(factor * 100)) + L"%";
+    if (WindowText(win.zoomLevelButton) != percent) ::SetWindowTextW(win.zoomLevelButton, percent.c_str());
+    // They come with a zoom and go with it, which is the layout's to see to: it knows
+    // where they go, and whether the window has room for them.
+    if (SameZoom(factor, SiteZoom::kNormal) == HasStyle(win.zoomLevelButton, WS_VISIBLE)) FitAddressBar(win);
 }
 
 } // namespace exodium

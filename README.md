@@ -11,12 +11,14 @@ A tabbed web browser that lives inside Winamp. It is a Winamp general purpose pl
   (right click) that mutes it, duplicates it, loads it again, or closes it, the others or
   those to its right
 - An address bar that completes and suggests from the history and the bookmarks, the way
-  Chrome's does, and takes what is typed the way a browser should (see
-  [The address bar](#the-address-bar))
+  Chrome's does, and takes what is typed the way a browser should; a × on a suggestion
+  forgets it (see [The address bar](#the-address-bar))
 - Bookmarks: a star on the toolbar and Ctrl+D, a bookmarks page (`exodium://bookmarks`),
   and Chrome's, Edge's, Brave's or Vivaldi's brought in with a click (see [Bookmarks](#bookmarks))
-- A history page (`exodium://history`) of the last 20,000 pages, per-site zoom, reopening of
-  closed tabs, fullscreen video
+- A history page (`exodium://history`) of the last 20,000 pages, reopening of closed tabs,
+  fullscreen video
+- Zoom that belongs to the site, as in Chrome, and is on the toolbar with a − and a + while
+  the page in view is at anything but 100% (see [Zoom](#zoom))
 - Tabs left out of view for two hours are put to sleep, which gives back all the memory
   their pages held (see [Sleeping tabs](#sleeping-tabs))
 - Private windows (Ctrl+Shift+N), whose pages leave nothing behind (see
@@ -163,6 +165,39 @@ an address if it ended like `.html`), `localhost` and addresses in numbers were 
 for, `localhost:3000` was handed to the webview without `http://`, and an error message
 with a colon in it went nowhere.
 
+A row of the list that the history put there ends in a ×, which forgets the row: what the
+history has behind it is taken out of the history, in its journal at once, and the list is
+made again without it. It is suggested again once it is visited again. What goes depends on
+the row (`PagesBehind` in `suggestions.h`):
+
+- A page: that page.
+- A site, which is what is offered while the typing is still inside a site's name, and which
+  every page visited on the site speaks for: every page of the site in the history, over
+  http and https, with `www.` and without. Nothing less would stop it being suggested.
+- A search made before: every results page of those words, on whichever search engine.
+
+A row that is only there for the typed text, or for a bookmark, has no ×: a bookmark is
+suggested for as long as it is one. A page that is in the history and a bookmark has one,
+which forgets its visits and leaves it there with its star. The × works as a tab's does:
+pressing it neither picks the row nor goes anywhere, and letting go anywhere but on it
+forgets nothing. There is no undoing it, short of visiting the pages again.
+
+## Zoom
+
+Zoom belongs to the site, as it does in Chrome: Ctrl with the wheel, + or − zooms the page
+for its host, every tab on that host follows, and it comes back whenever the host is
+visited again (`zoom.txt`). Ctrl+0 puts the site back to 100%.
+
+While the page in view is at anything but 100%, the toolbar says so between the address bar
+and the star: the percentage, with a − on its left and a + on its right. They go through
+the same sizes as the keys, Chrome's (25, 33, 50, 67, 75, 80, 90, 100, 110, 125, 150, 175,
+200, 250, 300, 400 and 500%), and a click on the percentage puts the page back to 100%. At
+100% none of the three is there and the address bar has their room, and a window too narrow
+for them and the address bar both goes without them.
+
+A page that has no site, such as a file, is zoomed for its tab alone, until the tab goes
+somewhere else; so are a private window's pages and Claude Code's.
+
 ## Bookmarks
 
 The star at the address bar's right end is empty while the page in view is no bookmark and
@@ -227,8 +262,9 @@ in its title bar, on the taskbar and in Alt+Tab.
 - Extensions aren't in them, Bitwarden included, and their tabs aren't put to sleep.
 
 Files downloaded in one are kept, and so are bookmarks made in one, as in Chrome. The
-address bar still suggests from the history and the bookmarks, which it only reads. What a
-site sees, and what the network sees, is the same as from any other window.
+address bar still suggests from the history and the bookmarks, and adds nothing to them; a
+row forgotten there by its × is forgotten in every window. What a site sees, and what the
+network sees, is the same as from any other window.
 
 ## The history on disk, and the log
 
@@ -948,6 +984,11 @@ Its Start menu checkbox makes and removes a shortcut in a scratch folder, which 
 opened with Winamp running and closed. It types a file's path into the address bar, sends
 a tab's menu's commands (as the menu itself does, by `kMsgTabCommand`), presses Ctrl+1,
 Ctrl+9, Ctrl+Page Up and Down and Ctrl+D, clicks the star, and opens the bookmarks page.
+On a site of its own, served from this computer for as long as it is needed, it types into
+the address bar and clicks the × on a page's row and on the site's, and the zoom's − and +
+and its percentage, and checks what the history, its journal and `zoom.txt` then hold, how
+large the pages are drawn, that the site's other tab follows, and that a narrow window goes
+without the zoom's buttons.
 In a run of its own, with a tab left for twelve seconds instead of two hours
 (`EXODIUM_SLEEP_TABS_MS`), it sees a tab out of view put to sleep and wake up when clicked,
 and one with text typed into it stay awake; opens a private window, and checks that its
@@ -1062,7 +1103,7 @@ Inside `exodium\src`:
 | `back_forward.cpp` | Back and Forward, and the page they lead to in a new tab or window with a copy of the tab's history; a reopened or restored tab is given its history the same way |
 | `session.cpp` | The windows and tabs kept from one run of Winamp to the next: saving them, and bringing them back as Winamp starts |
 | `session_file.cpp` | The same as the logic files: the session file, and what of a tab's history it keeps |
-| `fullscreen.cpp`, `zoom.cpp` | Fullscreen video, per-site zoom |
+| `fullscreen.cpp`, `zoom.cpp` | Fullscreen video; per-site zoom, and what the toolbar says of it |
 | `downloads.cpp` | Downloads: following them in place of WebView2's dialog, and what the panel's buttons do to them |
 | `downloads_panel.cpp` | The downloads button on the toolbar and the panel it opens |
 | `extensions.cpp` | Bitwarden and the helper in the user's profile: fetching Bitwarden from the Chrome Web Store on a thread of its own, putting a new version in place, turning it on and off, keeping the browser process up while it is on |

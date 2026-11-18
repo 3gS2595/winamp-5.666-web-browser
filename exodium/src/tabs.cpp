@@ -283,6 +283,7 @@ void ActivateTab(BrowserWindow& win, int index) {
     LayoutActiveWebView(win);
     UpdateUrlBox(win);
     UpdateReloadButton(win);
+    UpdateZoomButtons(win);
     UpdateFrameTitle(win);
     HideSuggestions(win);
 

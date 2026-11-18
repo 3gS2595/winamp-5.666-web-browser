@@ -146,7 +146,7 @@ void PutTabToSleep(Tab& tab) {
     if (!tab.lastUrl.empty()) tab.pendingUrl = tab.lastUrl;
     tab.loading = tab.typedNav = tab.parked = tab.crashed = tab.askingToSleep = false;
     tab.typedNavId = 0;
-    tab.zoom = SiteZoom::kNormal; // a new webview starts out at the normal size
+    ForgetTabZoom(tab); // a new webview starts out at the normal size
     // Where Back and Forward led went with the webview; its next one makes them again.
     GiveTabPages(tab, HistoryCopy(tab.pages));
 }

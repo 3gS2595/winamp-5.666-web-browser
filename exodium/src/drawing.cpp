@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 
 namespace exodium {
 
@@ -18,12 +19,13 @@ constexpr float kSpinnerInset = 2.0f;
 constexpr float kSpinnerSweep = 270.0f; // three quarters of a ring
 constexpr int kSuggestionPadding = 6;
 
-// A speaker giving out sound, in a square the size of a page's icon.
-void DrawSpeaker(HDC dc, int x, int y) {
+// A speaker giving out sound, in a square the size of a page's icon; or, of a tab the
+// user has muted, a dimmer one with a cross where the sound would come out.
+void DrawSpeaker(HDC dc, int x, int y, bool muted) {
     Gdiplus::Graphics graphics(dc);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     Gdiplus::Color inkColor;
-    inkColor.SetFromCOLORREF(color::kText);
+    inkColor.SetFromCOLORREF(muted ? color::kSuggestDim : color::kText);
     const Gdiplus::SolidBrush ink(inkColor);
     const Gdiplus::Pen wave(inkColor, 1.5f);
     const auto at = [x, y](float px, float py) { return Gdiplus::PointF(x + px, y + py); };
@@ -31,6 +33,11 @@ void DrawSpeaker(HDC dc, int x, int y) {
     const std::array body{at(1.5f, 6.0f),  at(4.5f, 6.0f),  at(8.5f, 2.5f),
                           at(8.5f, 13.5f), at(4.5f, 10.0f), at(1.5f, 10.0f)};
     graphics.FillPolygon(&ink, body.data(), static_cast<INT>(body.size()));
+    if (muted) {
+        graphics.DrawLine(&wave, at(10.5f, 5.5f), at(15.0f, 10.5f));
+        graphics.DrawLine(&wave, at(10.5f, 10.5f), at(15.0f, 5.5f));
+        return;
+    }
     // Two waves, a quarter of a circle each, spreading out from the cone's mouth.
     for (const float radius : {3.0f, 6.0f}) {
         graphics.DrawArc(&wave, x + 8.5f - radius, y + 8.0f - radius, 2 * radius, 2 * radius, -45.0f, 90.0f);
@@ -102,7 +109,7 @@ void DrawOwnerButton(const DRAWITEMSTRUCT& item, const Tab* tab, const ButtonLoo
         const bool busy = tab->busy();
         const TabParts parts = PlaceTabParts({rect.left, rect.top, rect.right, rect.bottom},
                                              {.icon = busy || tab->crashed || tab->favicon,
-                                              .speaker = tab->playingAudio,
+                                              .speaker = tab->playingAudio || tab->muted,
                                               .closeButton = g_app.settings.tabCloseButtons,
                                               .active = look.closeAlways});
         if (const TabBox& icon = parts.icon; !icon.empty()) {
@@ -116,7 +123,7 @@ void DrawOwnerButton(const DRAWITEMSTRUCT& item, const Tab* tab, const ButtonLoo
                 ::DrawIconEx(dc, icon.left, icon.top, tab->favicon.get(), kIconSize, kIconSize, 0, nullptr, DI_NORMAL);
             }
         }
-        if (!parts.speaker.empty()) DrawSpeaker(dc, parts.speaker.left, parts.speaker.top);
+        if (!parts.speaker.empty()) DrawSpeaker(dc, parts.speaker.left, parts.speaker.top, tab->muted);
         if (!parts.close.empty()) DrawCloseButton(dc, parts.close, look.closeHot, look.closePressed);
         textRect = {parts.title.left, parts.title.top, parts.title.right, parts.title.bottom};
     }
@@ -137,6 +144,47 @@ void DrawOwnerButton(const DRAWITEMSTRUCT& item, const Tab* tab, const ButtonLoo
     ::BitBlt(item.hDC, rect.left, rect.top, Width(rect), Height(rect), dc, rect.left, rect.top, SRCCOPY);
 }
 
+// The star at the address bar's end: an outline while the page in view is no bookmark,
+// and filled while it is one. Drawn rather than written, as the downloads button's arrow
+// is: the font's own star is a speck.
+void DrawBookmarkButton(const DRAWITEMSTRUCT& item, bool marked) {
+    const RECT rect = item.rcItem;
+    const UniqueDc buffer(::CreateCompatibleDC(item.hDC));
+    const UniqueBitmap bitmap(::CreateCompatibleBitmap(item.hDC, rect.right, rect.bottom));
+    const HDC dc = buffer.get();
+    const SelectedObject selectedBitmap(dc, bitmap.get());
+    const Theme& theme = g_app.theme;
+    ::FillRect(dc, &rect, ((item.itemState & ODS_SELECTED) ? theme.activeTab : theme.panel).get());
+    ::FrameRect(dc, &rect, theme.border.get());
+    {
+        Gdiplus::Graphics graphics(dc);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        // Five points, the first straight up, and the five corners between them.
+        constexpr float kOuter = 6.5f, kInner = 2.7f, kPi = 3.14159265f;
+        const float x = (rect.left + rect.right) / 2.0f - 0.5f, y = (rect.top + rect.bottom) / 2.0f;
+        std::array<Gdiplus::PointF, 10> points;
+        for (int i = 0; i < 10; ++i) {
+            const float angle = -kPi / 2 + static_cast<float>(i) * kPi / 5;
+            const float radius = i % 2 == 0 ? kOuter : kInner;
+            points[static_cast<std::size_t>(i)] = {x + radius * std::cos(angle), y + radius * std::sin(angle)};
+        }
+        Gdiplus::Color inkColor;
+        inkColor.SetFromCOLORREF(marked ? color::kSpinner : color::kText);
+        if (marked) {
+            const Gdiplus::SolidBrush fill(inkColor);
+            graphics.FillPolygon(&fill, points.data(), static_cast<INT>(points.size()));
+        }
+        const Gdiplus::Pen outline(inkColor, 1.2f);
+        graphics.DrawPolygon(&outline, points.data(), static_cast<INT>(points.size()));
+    }
+    if (item.itemState & ODS_FOCUS) {
+        RECT focus = rect;
+        ::InflateRect(&focus, -3, -3);
+        ::DrawFocusRect(dc, &focus);
+    }
+    ::BitBlt(item.hDC, rect.left, rect.top, Width(rect), Height(rect), dc, rect.left, rect.top, SRCCOPY);
+}
+
 void DrawSuggestion(const BrowserWindow& win, const DRAWITEMSTRUCT& item) {
     if (item.itemID >= win.suggestions.size()) return; // an empty list asks for item -1
     const Suggestion& suggestion = win.suggestions[item.itemID];
@@ -148,8 +196,10 @@ void DrawSuggestion(const BrowserWindow& win, const DRAWITEMSTRUCT& item) {
 
     // A page reads "Title - address" and a search "words - Google Search", or whichever
     // engine is in use. An address whose title isn't known stands alone.
+    // A bookmark has its star in front.
     const bool titled = !suggestion.search && !suggestion.title.empty();
-    const std::wstring& lead = titled ? suggestion.title : suggestion.text;
+    std::wstring lead = titled ? suggestion.title : suggestion.text;
+    if (suggestion.bookmarked) lead.insert(0, std::wstring(kGlyphBookmarked) + L" ");
     std::wstring tail;
     if (suggestion.search) tail = L" - " + SearchLabel();
     else if (titled) tail = L" - " + suggestion.text;

@@ -70,6 +70,10 @@ BrowserWindow* WindowAtPoint(POINT point) noexcept {
 DropTarget FindDropTarget(POINT point, const std::vector<int>& draggedIds) {
     BrowserWindow* const dst = WindowAtPoint(point);
     if (!dst || dst->isFullscreen || !dst->tabBar) return {};
+    // Private tabs stay in private windows, and the others out of them: over the other
+    // kind's strip there is nowhere to land, and the tabs get a window of their own kind.
+    const TabLocation dragged = FindTab(draggedIds.empty() ? 0 : draggedIds.front());
+    if (dragged && dragged.window->isPrivate != dst->isPrivate) return {};
 
     const RECT strip = WindowRectOf(dst->tabBar);
     RECT hit = strip;
@@ -134,8 +138,8 @@ void BeginTabDrag() {
     // the way of finding the window under the cursor.
     const DWORD exStyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
     drag.ghost.reset(::CreateWindowExW(exStyle, kTabGhostClass, WindowText(drag.button).c_str(), WS_POPUP,
-                                       button.left - before * step, button.top, count * step - kTabGap,
-                                       Height(button), nullptr, nullptr, g_app.instance, nullptr));
+                                       button.left - before * step, button.top, count * step - kTabGap, Height(button),
+                                       nullptr, nullptr, g_app.instance, nullptr));
     if (drag.ghost) ::SetLayeredWindowAttributes(drag.ghost.get(), 0, kGhostOpacity, LWA_ALPHA);
     drag.marker.reset(::CreateWindowExW(exStyle, L"STATIC", L"", WS_POPUP | SS_WHITERECT, 0, 0, kMarkerWidth,
                                         kTabBarHeight - 2, nullptr, nullptr, g_app.instance, nullptr));
@@ -358,6 +362,18 @@ LRESULT CALLBACK TabButtonProc(HWND button, UINT msg, WPARAM wParam, LPARAM lPar
         // Middle-click closes the tab, as its close button does.
         CloseTabByMouse(button);
         return 0;
+    case WM_RBUTTONUP:
+        // The tab's menu (tab_menu.cpp), unless a tab is being dragged, which it would end.
+        if (const ButtonTab clicked = TabOfButton(button); clicked && !drag.tabId && !closeMouse.pressed) {
+            POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ::ClientToScreen(button, &point);
+            ShowTabMenu(*clicked.window, clicked.window->tabs[clicked.index].id, point);
+        }
+        return 0;
+    case WM_DESTROY:
+        // While it still knows its window: what it said under the mouse goes with it.
+        RemoveTabTip(button);
+        break;
     case WM_CAPTURECHANGED:
         if (closeMouse.pressed == button) EndCloseButtonPress();
         if (drag.button == button) EndTabDrag();
@@ -416,7 +432,7 @@ void DropDraggedTab(const TabDrop& drop) {
             return;
         }
         const RECT place = WindowRectOf(src.frame);
-        dst = CreateBrowserWindow(true, &place, true);
+        dst = CreateBrowserWindow(true, &place, true, src.isPrivate);
         if (!dst) return;
     }
 

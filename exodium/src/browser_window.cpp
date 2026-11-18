@@ -16,13 +16,16 @@ namespace {
 
 // How far a new window opens down and right of the one before it.
 constexpr int kCascadeOffset = 30;
+// What a private window's title ends with.
+constexpr wchar_t kPrivateTitleEnd[] = L" (Private)";
 
-// Ctrl+N: opens at the size of the window it came from, stepped down and right of it.
-void OpenWindowLike(const BrowserWindow* win) {
+// Ctrl+N, and Ctrl+Shift+N for a private window: opens at the size of the window it came
+// from, stepped down and right of it.
+void OpenWindowLike(const BrowserWindow* win, bool isPrivate = false) {
     RECT place{};
     const bool like = win && ::GetWindowRect(win->frame, &place);
     if (like) ::OffsetRect(&place, kCascadeOffset, kCascadeOffset);
-    if (const BrowserWindow* opened = CreateBrowserWindow(true, like ? &place : nullptr)) {
+    if (const BrowserWindow* opened = CreateBrowserWindow(true, like ? &place : nullptr, false, isPrivate)) {
         ::SetForegroundWindow(opened->frame);
     }
 }
@@ -30,6 +33,11 @@ void OpenWindowLike(const BrowserWindow* win) {
 void OnDrawItem(BrowserWindow& win, const DRAWITEMSTRUCT& item) {
     if (item.CtlID == kIdSuggest) {
         DrawSuggestion(win, item);
+        return;
+    }
+    if (item.CtlID == kIdBookmark) {
+        // What it says is which star it shows (UpdateBookmarkButton); the star is drawn.
+        DrawBookmarkButton(item, WindowText(item.hwndItem) == kGlyphBookmarked);
         return;
     }
     // A tab's button is drawn with its tab's icon; a toolbar button has no tab.
@@ -75,6 +83,11 @@ bool OnCommand(BrowserWindow& win, int id, int code) {
             return true;
         case kIdCloseTab:
             CloseActiveTab(win);
+            return true;
+        case kIdBookmark:
+            ToggleBookmark(win);
+            // The click took the keyboard to the star, which has no use for it.
+            if (tab && tab->controller) MoveFocusToWebView(*tab);
             return true;
         case kIdNewTab:
             NewTab(win);
@@ -158,12 +171,32 @@ LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case kMsgOpenLinks:
         OpenPendingLinks();
         return 0;
+    case kMsgFollowSound:
+        LookAtPageSound();
+        return 0;
+    case kMsgRaiseDocked:
+        RaiseDockedWindows();
+        return 0;
+    case kMsgCloseDevTools:
+        OnDevToolsCloseMessage(wParam, lParam);
+        return 0;
+    case kMsgTabCommand: {
+        // The tab is known by its button, as it was when the command was picked. One that
+        // has gone since, or moved to another window, has none here.
+        const HWND button = reinterpret_cast<HWND>(lParam);
+        const auto tab = std::ranges::find_if(win.tabs, [button](const Tab& t) { return t.button.get() == button; });
+        if (button && tab != win.tabs.end()) RunTabCommand(win, tab->id, static_cast<TabCommand>(wParam));
+        return 0;
+    }
     case kMsgDiscardWindow:
         // Nothing of this window, `win` included, is left once this returns.
         DestroyBrowserWindow(win);
         std::erase_if(g_app.windows, [self](const auto& owned) { return owned.get() == self; });
         return 0;
 
+    case WM_WINDOWPOSCHANGING:
+        KeepClientInPlace(win, *reinterpret_cast<WINDOWPOS*>(lParam));
+        break;
     case WM_SIZE:
         LayoutToolbarAndTabs(win);
         return 0;
@@ -172,6 +205,10 @@ LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             OnSpinTimer(win);
             return 0;
         }
+        if (OnSessionTimer(wParam) || OnHistoryTimer(wParam) || OnSleepTimer(wParam)) return 0;
+        break;
+    case WM_NOTIFY:
+        if (OnTabTipNeeded(win, reinterpret_cast<NMHDR*>(lParam))) return 0;
         break;
     case WM_MOUSEWHEEL: {
         // Over the tab strip the wheel scrolls it. The strip's own controls pass the
@@ -187,7 +224,20 @@ LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // itself from a window that doesn't ask for it.
         return DLGC_WANTALLKEYS;
     case WM_KEYDOWN:
-        if (HandleGlobalShortcut(&win, wParam, CurrentModifiers())) return 0;
+    case WM_SYSKEYDOWN: { // a key with Alt comes as the second
+        const Modifiers mods = CurrentModifiers();
+        if (HandleGlobalShortcut(&win, wParam, mods) || HandleControlShortcut(win, wParam, mods)) return 0;
+        // Tab goes on into the page from here as it does from the address bar, where the
+        // keyboard was left waiting for a page still being made.
+        if (wParam == VK_TAB && !mods.ctrl && !mods.alt) {
+            TabIntoPage(win, mods.shift);
+            return 0;
+        }
+        break;
+    }
+    case WM_SYSCHAR:
+        // What Alt+D leaves behind, which Windows would look for a menu with, and beep.
+        if (wParam == L'd' || wParam == L'D') return 0;
         break;
     case WM_COMMAND:
         if (OnCommand(win, LOWORD(wParam), HIWORD(wParam))) return 0;
@@ -226,6 +276,13 @@ void RegisterWindowClass(const wchar_t* name, WNDPROC proc, HBRUSH background) {
 
 } // namespace
 
+RECT KeptOnScreen(const RECT& place) noexcept {
+    const RECT work = WorkAreaNear(place);
+    const int width = std::min(Width(place), Width(work)), height = std::min(Height(place), Height(work));
+    const POINT at = KeepInside(work, place.left, place.top, width, height);
+    return {at.x, at.y, at.x + width, at.y + height};
+}
+
 // ---- finding windows and tabs ----
 
 BrowserWindow* WindowFromClient(HWND client) noexcept {
@@ -257,6 +314,32 @@ TabLocation FindTab(int tabId) noexcept {
     return {};
 }
 
+BrowserWindow* FrontUserWindow() {
+    // Every top-level window, from the front.
+    std::vector<HWND> fromFront;
+    ::EnumWindows(
+        [](HWND window, LPARAM list) -> BOOL {
+            reinterpret_cast<std::vector<HWND>*>(list)->push_back(window);
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&fromFront));
+
+    BrowserWindow* front = nullptr;
+    std::pair<bool, std::ptrdiff_t> frontPlace;
+    for (const auto& win : g_app.windows) {
+        const Tab* const tab = ActiveTab(*win);
+        if (win->closing || win->isPrivate || !::IsWindowVisible(win->frame) || (tab && tab->forClaude)) continue;
+        // A frame docked into a skin is inside the skin's window. A minimized window comes
+        // after every one that isn't, wherever it is among them.
+        const HWND topLevel = ::GetAncestor(win->frame, GA_ROOT);
+        const std::pair place{win->minimized, std::ranges::find(fromFront, topLevel) - fromFront.begin()};
+        if (front && place >= frontPlace) continue;
+        front = win.get();
+        frontPlace = place;
+    }
+    return front;
+}
+
 // ---- windows ----
 
 void RegisterWindowClasses() {
@@ -271,11 +354,18 @@ void RegisterWindowClasses() {
     // The downloads button and panel paint all of themselves too.
     RegisterWindowClass(kDownloadsButtonClass, DownloadsButtonProc, nullptr);
     RegisterWindowClass(kDownloadsPanelClass, DownloadsPanelProc, nullptr);
+    // And Bitwarden's button, and the window round its popup.
+    RegisterWindowClass(kBitwardenButtonClass, BitwardenButtonProc, nullptr);
+    RegisterWindowClass(kBitwardenPopupClass, BitwardenPopupProc, nullptr);
+    // And the strip along the top of docked DevTools, and the splitter beside them.
+    RegisterWindowClass(kDevToolsBarClass, DevToolsBarProc, nullptr);
+    RegisterWindowClass(kDevToolsSplitterClass, DevToolsSplitterProc, nullptr);
 }
 
 void UnregisterWindowClasses() {
-    for (const wchar_t* name : {kClientClass, kFullscreenClass, kTabGhostClass, kOrnamentClass, kDownloadsButtonClass,
-                                kDownloadsPanelClass}) {
+    for (const wchar_t* name :
+         {kClientClass, kFullscreenClass, kTabGhostClass, kOrnamentClass, kDownloadsButtonClass, kDownloadsPanelClass,
+          kBitwardenButtonClass, kBitwardenPopupClass, kDevToolsBarClass, kDevToolsSplitterClass}) {
         ::UnregisterClassW(name, g_app.instance);
     }
 }
@@ -288,6 +378,8 @@ Tab& AddTab(BrowserWindow& win, std::wstring_view title, int index) {
     Tab& tab = *win.tabs.emplace(win.tabs.begin() + index);
     tab.id = g_app.nextTabId++;
     tab.title = title;
+    tab.seenAt = ::GetTickCount64(); // how long it has been out of view is counted from now
+    tab.isPrivate = win.isPrivate;   // every tab opened in a private window is private
     return tab;
 }
 
@@ -297,11 +389,15 @@ void UpdateFrameTitle(BrowserWindow& win) {
     if (!win.frame) return;
     const Tab* tab = ActiveTab(win);
     const bool untitled = !tab || tab->title.empty() || tab->title == kNewTabTitle;
-    ::SetWindowTextW(win.frame, untitled ? kAppName : tab->title.c_str());
+    std::wstring title = untitled ? std::wstring(kAppName) : tab->title;
+    // A private window says so, in its title bar, on the taskbar and in Alt+Tab.
+    if (win.isPrivate) title += kPrivateTitleEnd;
+    ::SetWindowTextW(win.frame, title.c_str());
 }
 
-BrowserWindow* CreateBrowserWindow(bool show, const RECT* place, bool forIncomingTab) {
+BrowserWindow* CreateBrowserWindow(bool show, const RECT* place, bool forIncomingTab, bool isPrivate) {
     BrowserWindow& win = *g_app.windows.emplace_back(std::make_unique<BrowserWindow>());
+    win.isPrivate = isPrivate;
 
     // Each window gets its own GUID so Winamp/skin engine can tell frames apart.
     if (FAILED(::CoCreateGuid(&win.guid))) win.guid = {};
@@ -310,7 +406,7 @@ BrowserWindow* CreateBrowserWindow(bool show, const RECT* place, bool forIncomin
         g_app.windows.pop_back();
         return nullptr;
     }
-    ::SetWindowTextW(win.frame, kAppName);
+    UpdateFrameTitle(win); // the browser's name, until a tab has a page's
     AttachFrame(win);
 
     if (place) {
@@ -326,10 +422,9 @@ BrowserWindow* CreateBrowserWindow(bool show, const RECT* place, bool forIncomin
         ::SetWindowPos(win.frame, nullptr, at.x, at.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
-    const RECT frame = ClientRectOf(win.frame);
-    win.client = ::CreateWindowExW(0, kClientClass, L"", WS_CHILD | WS_VISIBLE, kFrameInsetLeft, kFrameInsetTop,
-                                   frame.right - kFrameInsetLeft, frame.bottom - kFrameInsetTop, win.frame, nullptr,
-                                   g_app.instance, &win);
+    const RECT inside = ClientPlace(win);
+    win.client = ::CreateWindowExW(0, kClientClass, L"", WS_CHILD | WS_VISIBLE, inside.left, inside.top, Width(inside),
+                                   Height(inside), win.frame, nullptr, g_app.instance, &win);
     CreateControls(win);
     CreateOrnaments(win);
 
@@ -356,7 +451,8 @@ BrowserWindow* CreatePopupWindow(const BrowserWindow& opener, const PopupRequest
     // A minimized opener is a sliver parked off screen. The place it goes back to
     // stands in for it.
     const RECT from = ::IsIconic(opener.frame) ? opener.embedState.r : WindowRectOf(opener.frame);
-    BrowserWindow* const win = CreateBrowserWindow(true, &from, true);
+    // A window a private page opens is private too.
+    BrowserWindow* const win = CreateBrowserWindow(true, &from, true, opener.isPrivate);
     if (!win) return nullptr;
 
     const RECT work = WorkAreaNear(from);
@@ -388,15 +484,42 @@ BrowserWindow* CreatePopupWindow(const BrowserWindow& opener, const PopupRequest
     return win;
 }
 
+namespace {
+
+// A link from outside in a window there is already: in a new tab at the end of its strip
+// and in view, with the window brought to the front, as in Chrome.
+void OpenLinkInNewTab(BrowserWindow& win, std::wstring_view url) {
+    LeaveVideoFullscreen(win); // a video that has the screen has the tab strip out of use
+    if (::IsIconic(win.frame)) ::ShowWindow(win.frame, SW_RESTORE);
+    // The tab in view may be a link's as well, its page still to be made from the message
+    // loop. Out of view it would be left until it was looked at, and it is to load now.
+    if (const Tab* const inView = ActiveTab(win)) CreateWebViewForTab(win, inView->id);
+    // An address bar that is being typed in would otherwise keep the keyboard and its text.
+    if (::GetFocus() == win.urlEdit) ::SetFocus(win.client);
+    NewTab(win, url);
+    ::SetForegroundWindow(win.frame);
+}
+
+} // namespace
+
 // A link that leads to no page the browser would show is dropped. No link at all, which
 // is what the Start menu's entry sends, is a window on the home page.
 void OpenPendingLinks() {
+    // Up first, so that they don't come up over the link's window, and are there for it to go in.
+    ShowRestoredWindows();
     for (const std::wstring& link : std::exchange(g_app.pendingLinks, {})) {
         const std::optional<std::wstring> url = ResolveOutsideLink(link);
         if (!url) continue;
+        // The Start menu's entry, which started Winamp, and the windows of the last session came up with it.
+        if (url->empty() && WindowsRestoredForStart()) continue;
         // Claude Code's browser tools open their windows on this page and nothing else does.
         // Such a window is shown once it is in place; see claude_session.cpp.
         const bool forClaude = url->contains(kToolStartPage);
+        // A link goes in the window the user has in front, where there is one.
+        if (BrowserWindow* const front = url->empty() || forClaude ? nullptr : FrontUserWindow()) {
+            OpenLinkInNewTab(*front, *url);
+            continue;
+        }
         BrowserWindow* const win = CreateBrowserWindow(!forClaude);
         if (!win) continue;
         // Its webview is made from the message loop, so it isn't too late to say where it goes.
@@ -415,29 +538,37 @@ void OpenPendingLinks() {
 }
 
 // Closing a window closes its tabs, as closing them one by one would: their pages
-// stop, and Ctrl+Shift+T brings them back. The first window is the one Winamp's menu
-// shows, so it stays behind, hidden and with a blank tab, for the next time it is
-// asked for. Any other window is done with, and its tabs' webviews go with it: they
-// come back from their addresses, without Back and Forward. Every way of closing a
-// window ends up here: its close button, the taskbar, the keyboard, its last tab going.
+// stop, and Ctrl+Shift+T brings them back, all of them together as the window they were.
+// The first window is the one Winamp's menu shows, so it stays behind, hidden and with a
+// blank tab, for the next time it is asked for. Any other window is done with, and its
+// tabs' webviews go with it: they come back from their pages, which they make their Back
+// and Forward again. Every way of closing a window ends up here: its close button, the
+// taskbar, the keyboard, its last tab going.
 void CloseBrowserWindow(BrowserWindow& win) {
     if (win.closing) return;
     win.closing = &win != g_app.windows.front().get();
     LeaveVideoFullscreen(win);
     if (g_app.drag.tabId && FindTab(g_app.drag.tabId).window == &win) EndTabDrag();
 
-    // The tab in view goes last, which makes it the first to come back.
+    ClosedWith with{.window = std::make_shared<const ClosedWindow>(ClosedWindow{
+                        .place = NormalPlace(win), .maximized = IsMaximized(win), .activeIndex = win.active})};
+    // Taken out from the right, so that each is at the place it had until it goes. The
+    // tab in view goes last.
     int last = win.active;
     for (int i = static_cast<int>(win.tabs.size()) - 1; i >= 0; --i) {
         if (i == last) continue;
-        RemoveTab(win, i);
+        with.index = i;
+        RemoveTab(win, i, with);
         if (i < last) --last;
     }
-    if (!win.tabs.empty()) RemoveTab(win, 0);
+    with.index = with.window->activeIndex;
+    if (!win.tabs.empty()) RemoveTab(win, 0, with);
+    TrimClosedTabs();
     win.active = -1;
     win.editDirty = false; // whatever was being typed belonged to a tab that is gone
     HideSuggestions(win);
     CloseDownloadsPanel(win);
+    CloseBitwardenPopupOf(win);
     ::ShowWindow(win.frame, SW_HIDE);
 
     if (win.closing) {
@@ -457,6 +588,7 @@ void CloseBrowserWindow(BrowserWindow& win) {
 
 void DestroyBrowserWindow(BrowserWindow& win) {
     win.fullscreenWindow.reset();
+    CloseBitwardenPopupOf(win); // the frame owns it, and would take it along unasked
 
     // A maximized or minimized window is remembered at the size it goes back to.
     WINDOWPLACEMENT placement{.length = sizeof(placement)};
@@ -479,6 +611,9 @@ void DestroyBrowserWindow(BrowserWindow& win) {
     win.tabs.clear(); // closes their webviews and takes their buttons out of the strip
     win.discardedTabs.clear();
     win.downloads = {}; // its button and panel go with the client, and nothing is to reach them on the way
+    win.devtools = {};  // as do the DevTools' strip and splitter
+    // The tabs' tips are a window of their own, which the frame owns; it goes before its tabs' buttons do.
+    if (win.tabTips) ::DestroyWindow(std::exchange(win.tabTips, nullptr));
     if (win.client) ::DestroyWindow(win.client); // and with it every control
     win.client = nullptr;
     win.suggestList = nullptr;
@@ -498,14 +633,20 @@ void DestroyBrowserWindow(BrowserWindow& win) {
 // destroys them.
 void ShutDownBrowser() {
     if (g_app.shutDown) return;
+    // The windows and tabs as Winamp leaves them, before anything of them goes.
+    SaveSession();
     g_app.shutDown = true;
     StopWinampNewWindowKey();
+    StopGlow(); // before Winamp's windows start to go, which it would follow
+    StopRaisingDockedWindows();
     StopWatchingClaudeSessions();
+    StopExtensions(); // Bitwarden's popup goes with it
     // Before the webviews go: nothing a download says after this is listened for.
     StopFollowingDownloads();
-    g_app.history.Save(HistoryFile());
+    SaveHistoryNow();
     EndTabDrag();
     if (g_app.debuggingPort != 0) CloseBrowserProcess();
+    DetachLibraryOrnaments(); // the library goes on until gen_ml is done with it
 
     // Out of sight at once; taking the webviews apart can take a moment.
     for (const auto& win : g_app.windows) {
@@ -533,23 +674,66 @@ bool HandleGlobalShortcut(BrowserWindow* win, WPARAM key, Modifiers mods) {
     }
     if (!win) return false;
 
+    // A private window, as Chrome's Ctrl+Shift+N opens an Incognito one.
+    if (mods == kCtrlShift && key == 'N') {
+        OpenWindowLike(win, true);
+        return true;
+    }
+
+    // F12 and Ctrl+Shift+I, J and C are the DevTools', docked in the window where they can
+    // be. Where they can't, the keys are left to the page's webview, which opens its own.
+    if (HandleDevToolsShortcut(*win, key, mods)) return true;
+
     // Escape closes the downloads panel, wherever the keyboard is in the window. While the
     // panel is closed it is left alone, for the page or the control it was pressed in. The
     // modifier keys aren't looked at: one let go of while another program had the keyboard
     // can still count as held here.
     if (key == VK_ESCAPE && !win->isFullscreen && CloseDownloadsPanel(*win)) return true;
 
+    // Ctrl+1 to Ctrl+9, on the row of digits or the number pad: a tab by its place in the strip.
+    const int tabNumber = mods != kCtrl                            ? 0
+                          : key >= '1' && key <= '9'               ? static_cast<int>(key - '0')
+                          : key >= VK_NUMPAD1 && key <= VK_NUMPAD9 ? static_cast<int>(key - VK_NUMPAD0)
+                                                                   : 0;
+    const bool addressBarKey = (mods == kAlt && key == 'D') || (mods == kNoModifiers && key == VK_F6);
+    const bool pageKey = mods == kCtrl && (key == VK_NEXT || key == VK_PRIOR); // Ctrl+Page Down and Up
+
     // These need the tab strip and toolbar back, so they end fullscreen video first.
     const bool ctrlWithoutAlt = mods.ctrl && !mods.alt;
-    if (win->isFullscreen && ctrlWithoutAlt &&
-        (key == 'L' || key == 'T' || key == 'W' || key == 'H' || key == VK_TAB)) {
-        LeaveVideoFullscreen(*win);
+    const bool needsStrip =
+        (ctrlWithoutAlt && (key == 'L' || key == 'T' || key == 'W' || key == 'H' || key == VK_TAB)) ||
+        (mods == kCtrlShift && key == 'O') || tabNumber != 0 || addressBarKey || pageKey;
+    if (win->isFullscreen && needsStrip) LeaveVideoFullscreen(*win);
+
+    if (tabNumber != 0) {
+        SwitchToTabByNumber(*win, tabNumber);
+        return true;
+    }
+    if (pageKey) {
+        if (key == VK_NEXT) NextTab(*win);
+        else PrevTab(*win);
+        return true;
+    }
+    // Alt+D and F6 are the address bar's as well as Ctrl+L, as in Chrome.
+    if (addressBarKey) {
+        FocusAddressBar(*win);
+        win->editDirty = true;
+        return true;
     }
 
     if (mods == kCtrl) {
         switch (key) {
         case 'H':
             OpenHistory(*win);
+            return true;
+        case 'D':
+            ToggleBookmark(*win);
+            return true;
+        case 'J':
+            // The downloads, while there are any to show; otherwise the key is the page's.
+            if (CloseDownloadsPanel(*win)) return true;
+            if (g_app.downloads.empty() || win->isFullscreen) break;
+            ShowDownloadsPanel(*win, false);
             return true;
         case 'L':
             FocusAddressBar(*win);
@@ -574,6 +758,12 @@ bool HandleGlobalShortcut(BrowserWindow* win, WPARAM key, Modifiers mods) {
         ReopenLastClosedTab(*win);
         return true;
     }
+    if (mods == kCtrlShift && key == 'O') {
+        OpenBookmarks(*win);
+        return true;
+    }
+    // Bitwarden's own shortcut in Chrome. Without Bitwarden it is the page's.
+    if (mods == kCtrlShift && key == 'Y' && ToggleBitwardenPopup(*win)) return true;
     if ((mods == kCtrlShift && key == 'W') || (mods == kAlt && key == VK_F4)) {
         CloseBrowserWindow(*win);
         return true;
@@ -590,6 +780,14 @@ bool HandleGlobalShortcut(BrowserWindow* win, WPARAM key, Modifiers mods) {
         }
     }
     return false;
+}
+
+bool HandleControlShortcut(BrowserWindow& win, WPARAM key, Modifiers mods) {
+    const bool reload = (key == VK_F5 && mods == kNoModifiers) || (key == 'R' && mods == kCtrl);
+    const bool pastCache = (key == VK_F5 && mods == kCtrl) || (key == 'R' && mods == kCtrlShift);
+    if (!reload && !pastCache) return false;
+    if (Tab* const tab = ActiveTab(win)) ReloadTab(*tab, pastCache);
+    return true;
 }
 
 } // namespace exodium

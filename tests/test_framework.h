@@ -34,6 +34,15 @@ void ReportFailure(std::string_view message, const std::source_location& where);
 [[nodiscard]] inline std::string Describe(wchar_t value) {
     return Describe(std::wstring_view(&value, 1));
 }
+[[nodiscard]] inline std::string Describe(std::string_view value) {
+    return std::format("\"{}\"", value);
+}
+[[nodiscard]] inline std::string Describe(const std::string& value) {
+    return Describe(std::string_view(value));
+}
+[[nodiscard]] inline std::string Describe(const char* value) {
+    return Describe(std::string_view(value));
+}
 [[nodiscard]] inline std::string Describe(bool value) {
     return value ? "true" : "false";
 }

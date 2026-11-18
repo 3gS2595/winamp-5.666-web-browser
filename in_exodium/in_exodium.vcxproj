@@ -50,18 +50,21 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <!-- ActivateAudioInterfaceAsync -->
-      <AdditionalDependencies>mmdevapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- ActivateAudioInterfaceAsync; AvSetMmThreadCharacteristics -->
+      <AdditionalDependencies>mmdevapi.lib;avrt.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="capture.h" />
     <ClInclude Include="sound_blocks.h" />
+    <ClInclude Include="sound_mark.h" />
+    <ClInclude Include="vis_latency.h" />
     <ClInclude Include="..\exodium\src\sound_ipc.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="capture.cpp" />
     <ClCompile Include="in_exodium.cpp" />
+    <ClCompile Include="vis_latency.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

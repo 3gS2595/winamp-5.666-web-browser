@@ -458,17 +458,6 @@ void PlacePanel(BrowserWindow& win, bool show) {
                    kHeaderHeight + rows * kRowHeight + kBottomPadding, SWP_NOACTIVATE | (show ? SWP_SHOWWINDOW : 0));
 }
 
-// The address bar makes room for the button, or takes back the room it gave, without
-// the rest of the window being laid out again: it may be being typed in.
-void FitAddressBar(BrowserWindow& win) {
-    RECT edit = WindowRectOf(win.urlEdit);
-    ::MapWindowPoints(nullptr, win.client, reinterpret_cast<POINT*>(&edit), 2);
-    // Where LayoutToolbarAndTabs ends the toolbar.
-    const int right = LayoutDownloads(win, ClientRectOf(win.client).right - kMargin, edit.top, Height(edit));
-    ::MoveWindow(win.urlEdit, edit.left, edit.top, std::max(kUrlMinWidth, right - static_cast<int>(edit.left)),
-                 Height(edit), TRUE);
-}
-
 // One bit for each of the mouse's buttons that is down.
 [[nodiscard]] BYTE MouseButtonsDown() noexcept {
     unsigned down = 0, bit = 1;

@@ -20,7 +20,8 @@
         do that.
       - Tells Claude Code about Exodium's browser tools, and puts back CLAUDE.md, the
         exodium permissions in settings.json, and Claude's memory of the Exodium repo.
-        What this PC already has is kept.
+        What this PC already has is kept. The browser tools' hooks in settings.json are
+        pointed at this PC's Winamp folder.
 
     Nothing else needs installing for Exodium: it has the C++ runtime built in.
 
@@ -206,6 +207,31 @@ function RunTolerant([scriptblock]$block) {
     finally { $ErrorActionPreference = $saved }
 }
 
+# Claude Code's hooks for the browser tools (see "Letting Claude Code drive it" in the
+# README), naming the hook script where it is on this PC. Those naming it anywhere else, as
+# the old PC's settings do when Winamp has moved, are replaced; other hooks are left alone.
+# True if the file was changed, after keeping it as it was beside it.
+function SetExodiumHooks([string]$settingsFile, [string]$hookScript) {
+    $settings = if (Test-Path -LiteralPath $settingsFile) { Get-Content -LiteralPath $settingsFile -Raw | ConvertFrom-Json } else { [pscustomobject]@{} }
+    if (-not $settings.hooks) { $settings | Add-Member -NotePropertyName hooks -NotePropertyValue ([pscustomobject]@{}) -Force }
+    $command = 'node "' + $hookScript.Replace('\', '/') + '"'
+    $changed = $false
+    foreach ($event in "PreToolUse", "SubagentStop", "Stop") {
+        $hook = [object[]]@([pscustomobject]@{ type = "command"; command = $command; timeout = 10 })
+        $wanted = if ($event -eq "PreToolUse") { [pscustomobject]@{ matcher = "mcp__exodium__.*"; hooks = $hook } } else { [pscustomobject]@{ hooks = $hook } }
+        $groups = @($settings.hooks.$event | Where-Object { $_ })
+        $ours = @($groups | Where-Object { @($_.hooks | Where-Object { "$($_.command)" -like "*exodium_hook.mjs*" }).Count -gt 0 })
+        if ($ours.Count -eq 1 -and ($ours[0] | ConvertTo-Json -Depth 8 -Compress) -eq ($wanted | ConvertTo-Json -Depth 8 -Compress)) { continue }
+        $others = @($groups | Where-Object { $ours -notcontains $_ })
+        $settings.hooks | Add-Member -NotePropertyName $event -NotePropertyValue ([object[]]($others + $wanted)) -Force
+        $changed = $true
+    }
+    if (-not $changed) { return $false }
+    if (Test-Path -LiteralPath $settingsFile) { Copy-Item -LiteralPath $settingsFile -Destination "$settingsFile.before-hooks.bak" -Force }
+    [IO.File]::WriteAllText($settingsFile, ($settings | ConvertTo-Json -Depth 64), (New-Object Text.UTF8Encoding $false))
+    $true
+}
+
 # ---- Checks, before anything is written ----
 
 $bundle = $PSScriptRoot
@@ -353,6 +379,13 @@ if (-not $SkipClaude -and (Test-Path -LiteralPath $fromClaude)) {
                 $todo.Add("Couldn't add Exodium's permissions to $to ($($_.Exception.Message)). The old PC's settings.json is in $fromClaude.")
             }
         }
+    }
+    try {
+        $hookScript = Join-Path $WinampDir "Plugins\exodium_hook.mjs"
+        if (SetExodiumHooks $to $hookScript) { "Pointed Claude Code's hooks for the browser tools at $hookScript (the file as it was is settings.json.before-hooks.bak)." }
+    }
+    catch {
+        $todo.Add("Couldn't add the browser tools' hooks to $to ($($_.Exception.Message)). The README's `"Letting Claude Code drive it`" says what they are.")
     }
 
     $fromMemory = Join-Path $fromClaude "memory"

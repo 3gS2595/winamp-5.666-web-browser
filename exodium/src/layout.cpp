@@ -14,6 +14,7 @@ constexpr int kTabHeight = kTabBarHeight - 2;
 // The address bar keeps this much of a narrow window before the buttons stop shrinking.
 constexpr int kUrlReservedWidth = 160;
 constexpr int kToolbarButtonCount = 4;
+constexpr int kBookmarkButtonWidth = 28; // the star's; as wide as the downloads button
 
 [[nodiscard]] int TabCount(const BrowserWindow& win) noexcept {
     return static_cast<int>(win.tabs.size());
@@ -40,6 +41,17 @@ void ShowControl(HWND control, bool show) noexcept {
     if (control) ::ShowWindow(control, show ? SW_SHOWNA : SW_HIDE);
 }
 
+// Lays out the buttons at the toolbar's right end. Two of them come and go: Bitwarden's,
+// while it is there, at the very end, and the downloads button, while there are downloads,
+// left of it. The star that bookmarks the page in view is always there, left of both and
+// right up against the address bar. Says where the address bar has to end.
+int LayoutToolbarEnd(BrowserWindow& win, int top, int height) {
+    int right = LayoutBitwardenButton(win, ClientRectOf(win.client).right - kMargin, top, height);
+    right = LayoutDownloads(win, right, top, height);
+    ::MoveWindow(win.bookmarkButton, right - kBookmarkButtonWidth, top, kBookmarkButtonWidth, height, TRUE);
+    return right - kBookmarkButtonWidth - kButtonGap;
+}
+
 // Where a window's tab strip begins and ends: clear of the ornaments on its corners.
 [[nodiscard]] int TabStripLeft(const BrowserWindow& win) noexcept {
     return OrnamentStripCover(win).left;
@@ -63,19 +75,27 @@ void CreateControls(BrowserWindow& win) {
     win.reloadButton = CreateButton(win, kGlyphReload, kIdReload);
     win.closeTabButton = CreateButton(win, L"X", kIdCloseTab);
     CreateAddressBar(win);
+    win.bookmarkButton = CreateButton(win, kGlyphBookmark, kIdBookmark);
     CreateDownloadsControls(win);
+    CreateBitwardenButton(win);
+    CreateTabTips(win);
+    CreateDevToolsControls(win); // after the tips, which its buttons have too
 }
 
 RECT WebViewBounds(const BrowserWindow& win) {
     const RECT client = ClientRectOf(win.client);
-    return {kMargin, kTabBarHeight + kToolbarHeight, client.right - kMargin, client.bottom - kMargin};
+    // Maximized, the page goes right to the screen's edges, as the window does.
+    const int margin = IsMaximized(win) ? 0 : kMargin;
+    return {margin, kTabBarHeight + kToolbarHeight, client.right - margin, client.bottom - margin};
 }
 
 void LayoutActiveWebView(BrowserWindow& win) {
     if (win.isFullscreen) return; // bounds/parent are driven by the fullscreen window instead
-    const Tab* tab = ActiveTab(win);
+    Tab* const tab = ActiveTab(win);
+    // The tab's DevTools, while they are docked, have their side of the page's place.
+    const RECT page = LayoutDevTools(win, tab, WebViewBounds(win));
     if (!tab || !tab->controller) return;
-    tab->controller->put_Bounds(WebViewBounds(win));
+    tab->controller->put_Bounds(page);
     tab->controller->put_IsVisible(TRUE);
     // A webview made or brought into the window since the panel opened is in front of it.
     RaiseDownloadsPanel(win);
@@ -84,6 +104,7 @@ void LayoutActiveWebView(BrowserWindow& win) {
 void HideAllWebViews(BrowserWindow& win) {
     for (Tab& tab : win.tabs) {
         if (tab.controller) tab.controller->put_IsVisible(FALSE);
+        if (tab.devtools.controller) tab.devtools.controller->put_IsVisible(FALSE);
     }
 }
 
@@ -136,6 +157,7 @@ void LayoutTabStrip(BrowserWindow& win) {
                 CreateControl(win, L"BUTTON", tab.title.empty() ? kNewTabTitle : tab.title.c_str(), BS_OWNERDRAW, id));
             SubclassControl(tab.button.get());
             SubclassTabButton(tab.button.get());
+            AddTabTip(win, tab.button.get());
         } else {
             ::SetWindowLongPtrW(tab.button.get(), GWLP_ID, id);
         }
@@ -192,12 +214,19 @@ void LayoutToolbarAndTabs(BrowserWindow& win) {
         ::MoveWindow(button, x, y, buttonWidth, height, TRUE);
         x += buttonWidth + kButtonGap;
     }
-    // The downloads button, while there is one, takes the toolbar's right end.
-    const int urlRight = LayoutDownloads(win, static_cast<int>(client.right) - kMargin, y, height);
+    const int urlRight = LayoutToolbarEnd(win, y, height);
     ::MoveWindow(win.urlEdit, x, y, std::max(kUrlMinWidth, urlRight - x), height, TRUE);
 
     HideSuggestions(win);
     LayoutActiveWebView(win);
+}
+
+void FitAddressBar(BrowserWindow& win) {
+    RECT edit = WindowRectOf(win.urlEdit);
+    ::MapWindowPoints(nullptr, win.client, reinterpret_cast<POINT*>(&edit), 2);
+    const int right = LayoutToolbarEnd(win, edit.top, Height(edit));
+    ::MoveWindow(win.urlEdit, edit.left, edit.top, std::max(kUrlMinWidth, right - static_cast<int>(edit.left)),
+                 Height(edit), TRUE);
 }
 
 void SetToolbarControlsVisible(BrowserWindow& win, bool visible) {
@@ -209,11 +238,16 @@ void SetToolbarControlsVisible(BrowserWindow& win, bool visible) {
         ShowControl(win.tabsRightButton, false);
     }
     for (const Tab& tab : win.tabs) ShowControl(tab.button.get(), visible);
-    for (const HWND control : {win.backButton, win.forwardButton, win.reloadButton, win.closeTabButton, win.urlEdit}) {
+    for (const HWND control :
+         {win.backButton, win.forwardButton, win.reloadButton, win.closeTabButton, win.urlEdit, win.bookmarkButton}) {
         ShowControl(control, visible);
     }
     ShowDownloadsButton(win, visible);
-    if (!visible) HideSuggestions(win);
+    ShowBitwardenButton(win, visible);
+    if (!visible) {
+        HideSuggestions(win);
+        HideDevTools(win); // they come back with the page, when the window is laid out again
+    }
 }
 
 } // namespace exodium

@@ -11,14 +11,18 @@
 #include "capture.h"
 #include "sound_blocks.h"
 #include "sound_ipc.h"
+#include "sound_mark.h"
+#include "vis_latency.h"
 
 #include <windows.h>
 
 #include <in2.h>
+#include <wa_ipc.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cwchar>
+#include <iterator>
 #include <mutex>
 #include <string>
 
@@ -26,26 +30,20 @@ namespace exodium {
 
 namespace {
 
-// How far behind the moment the time Winamp is told is, and so the sound the visualizers
-// are shown. Winamp only finds the visualization plug-ins' data reliably when it has been
-// given some ahead of that time, as an input plug-in that plays ahead into an output
-// plug-in's buffer always has; the newest sound here is 25 to 40 ms old when it arrives
-// in blocks. At 30 MilkDrop and the like got nothing for a few moments at a time in the
-// first seconds; at 60 they got every block from the start (measured 2026-11-03). The
-// speakers play sound some 10 to 30 ms after it is recorded, so the pictures trail what
-// is heard by less than that.
-constexpr int kVisLagMs = 60;
 // The most sound Winamp keeps for the visualizers, ahead of what they show.
 constexpr int kVisBufferMs = 500;
 // What the main window shows for it: kbps and kHz.
 constexpr int kShownBitrate = kSoundRate * kSoundChannels * 16 / 1000;
 constexpr int kShownKhz = kSoundRate / 1000;
+// How often to look again at which visualization plug-in runs (vis_latency.h): one started
+// after the pages' sound is given its sound from that far ahead within this long.
+constexpr std::int64_t kVisLookEvery = kTicksPerSecond / 4;
 
 In_Module g_module;
 SoundCapture g_capture;
 std::atomic<bool> g_playing{false}; // between Play and Stop; GetOutputTime is asked from Winamp's other threads too
 
-// The time Winamp shows, which the visualizers' data is timed by: since Play, less pauses.
+// The blocks' times, which the visualizers' data is timed by: since Play, less pauses.
 std::atomic<std::int64_t> g_startedAt{0}; // ticks
 std::atomic<std::int64_t> g_pausedFor{0}; // ticks
 std::atomic<std::int64_t> g_pausedAt{0};  // ticks; 0 when not paused
@@ -54,6 +52,22 @@ std::atomic<std::int64_t> g_pausedAt{0};  // ticks; 0 when not paused
     return static_cast<int>((at - g_startedAt.load() - g_pausedFor.load()) / (kTicksPerSecond / 1000));
 }
 
+// The time Winamp is told it is playing, less the running visualization plug-in's latencyMs:
+// just before the first copy of the last block handed on (sound_blocks.h). At each picture
+// Winamp hands a visualization plug-in the first block it hasn't yet that starts after the
+// time it asks for, so this has it hand on the newest sound there is, the end of a packet
+// that came at most 10 ms before, and the same again to a plug-in that draws again before
+// the next packet. A time that went on with the clock instead, as a player's does, has to
+// stay far enough behind it for there to be a block after it even just before a packet
+// comes: so it was until 2026-11-07, 35 ms behind, and the visualizers were shown sound 30
+// to 34 ms old, and AVS, which asks for 14 ms ahead, nothing or sound from seconds before in
+// half its pictures.
+std::atomic<int> g_shownFromMs{0};
+std::atomic<int> g_visLatencyMs{0}; // the running visualization plug-in's (vis_latency.h)
+VisPlugins g_visPlugins;
+// The capture thread's own: when it last looked for the visualization plug-in.
+std::int64_t g_visLookedAt = 0;
+
 // The page's title, from gen_browser.dll.
 std::mutex g_titleLock;
 std::wstring g_title;
@@ -61,6 +75,8 @@ std::wstring g_title;
 // Multiplies the sound by this much before the visualizers see it. Only ever set by the
 // smoke test, whose tone is too quiet to hear and so too quiet for them to show.
 int g_gain = 1;
+// Has each block carry when it was heard (sound_mark.h). Only ever set by the smoke test.
+bool g_mark = false;
 
 [[nodiscard]] bool IsOurs(const wchar_t* file) noexcept {
     return file && ::_wcsnicmp(file, kSoundScheme, std::wcslen(kSoundScheme)) == 0;
@@ -71,8 +87,35 @@ void GiveToVisualizers(const SoundBlock& block) {
     const int at = StreamMs(block.heardAt);
     if (at < 0) return; // from before Play
     auto* samples = const_cast<std::int16_t*>(block.samples); // Winamp's functions don't write to it
-    g_module.SAAddPCMData(samples, kSoundChannels, 16, at);
-    g_module.VSAAddPCMData(samples, kSoundChannels, 16, at);
+    std::int16_t marked[kVisBlockFrames * kSoundChannels];
+    if (g_mark) {
+        std::copy_n(block.samples, std::size(marked), marked);
+        MarkSound(marked, kSoundChannels, SoundMarkTime(block.heardAt));
+        samples = marked;
+    }
+    for (int copy = 0; copy < kVisBlockCopies; ++copy) {
+        g_module.SAAddPCMData(samples, kSoundChannels, 16, at + copy);
+        g_module.VSAAddPCMData(samples, kSoundChannels, 16, at + copy);
+    }
+    // Only once Winamp has the block is it told to show it.
+    g_shownFromMs = at - 1;
+
+    if (block.heardAt - g_visLookedAt >= kVisLookEvery) {
+        g_visLookedAt = block.heardAt;
+        g_visLatencyMs = g_visPlugins.RunningLatencyMs(g_module.hMainWindow);
+    }
+}
+
+// Where Winamp loads visualization plug-ins from; asked on Winamp's own thread. A Winamp
+// that doesn't answer is taken to load them from where it loads this one.
+std::wstring VisFolder() {
+    const LRESULT answer = ::SendMessageW(g_module.hMainWindow, WM_WA_IPC, 0, IPC_GETVISDIRECTORYW);
+    if (answer > 0xFFFF) {
+        if (const auto* folder = reinterpret_cast<const wchar_t*>(answer); *folder) return folder;
+    }
+    std::wstring self(MAX_PATH, L'\0');
+    self.resize(::GetModuleFileNameW(g_module.hDllInstance, self.data(), MAX_PATH));
+    return self.substr(0, self.find_last_of(L'\\'));
 }
 
 void ShowAbout(HWND parent) {
@@ -86,6 +129,7 @@ void ShowAbout(HWND parent) {
 void Init() {
     wchar_t gain[16]{};
     if (::GetEnvironmentVariableW(L"EXODIUM_SOUND_TEST_GAIN", gain, 16)) g_gain = std::clamp(_wtoi(gain), 1, 10000);
+    g_mark = ::GetEnvironmentVariableW(L"EXODIUM_SOUND_TEST_MARK", nullptr, 0) != 0;
 }
 
 void Stop();
@@ -118,9 +162,15 @@ int IsOurFile(const wchar_t* file) {
 
 int Play(const wchar_t*) {
     Stop();
-    g_startedAt = TicksNow();
+    // A block's worth before now, so that the silence the first packet's blocks begin with
+    // (sound_blocks.h) is after it too.
+    g_startedAt = TicksNow() - FramesToTicks(kVisBlockFrames);
     g_pausedFor = 0;
     g_pausedAt = 0;
+    g_shownFromMs = 0;
+    g_visLookedAt = g_startedAt;
+    g_visPlugins.Find(VisFolder().c_str());
+    g_visLatencyMs = g_visPlugins.RunningLatencyMs(g_module.hMainWindow);
     g_module.SAVSAInit(kVisBufferMs, kSoundRate);
     g_module.VSASetInfo(kSoundRate, kSoundChannels);
     g_module.SetInfo(kShownBitrate, kShownKhz, 1, 1);
@@ -151,10 +201,10 @@ int GetLength() {
     return -1000; // a stream's: it goes on as long as the pages make sound
 }
 
+// Paused, no blocks are handed on, so it stays where it was.
 int GetOutputTime() {
     if (!g_playing) return 0;
-    const std::int64_t paused = g_pausedAt.load();
-    return std::max(0, StreamMs(paused ? paused : TicksNow()) - kVisLagMs);
+    return std::max(0, g_shownFromMs.load() - g_visLatencyMs.load());
 }
 
 void SetOutputTime(int) {}

@@ -156,17 +156,4 @@ inline constexpr Modifiers kAlt{.alt = true};
     return {.ctrl = IsKeyDown(VK_CONTROL), .shift = IsKeyDown(VK_SHIFT), .alt = IsKeyDown(VK_MENU)};
 }
 
-// ---- diagnostics ----
-
-// Reports a failed call in the debugger's output window; the plugin has no log of
-// its own.
-inline void TraceFailure(std::wstring_view what, HRESULT result) {
-    char code[2 * sizeof(result)];
-    const char* const begin = code;
-    const char* const end = std::to_chars(code, code + sizeof(code), static_cast<unsigned long>(result), 16).ptr;
-    std::wstring line = L"[exodium] ";
-    line.append(what).append(L" failed: 0x").append(begin, end).append(1, L'\n');
-    ::OutputDebugStringW(line.c_str());
-}
-
 } // namespace exodium

@@ -12,7 +12,19 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\bookmarks.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\json_reader.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\browser.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\corner_skins.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\devtools_layout.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\download_status.h">
@@ -21,7 +33,13 @@
     <ClInclude Include="src\embed_frame.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\extension_package.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\gdiplus_headers.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\glow_shape.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\history.h">
@@ -37,6 +55,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\search_engines.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\session_file.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\session_history.h">
@@ -89,7 +110,16 @@
     <ClCompile Include="src\claude_session.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\devtools_layout.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\devtools_panel.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\download_status.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\docked_windows.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\downloads.cpp">
@@ -104,10 +134,49 @@
     <ClCompile Include="src\embed_frame.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\bitwarden_popup.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\bookmarks.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\bookmarks_page.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\bookmarks_ui.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\history_store.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\log.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\sleeping_tabs.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tab_menu.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\extension_package.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\extensions.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\frame.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\library_frame.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\fullscreen.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\glow.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\glow_shape.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\history.cpp">
@@ -132,6 +201,12 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\search_engines.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\session.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\session_file.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\session_history.cpp">
@@ -202,6 +277,42 @@
       <Filter>Resource Files</Filter>
     </Image>
     <Image Include="res\corner_ornament_plain.png">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="res\corner_venom_top_right.png">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="res\corner_venom_top_left.png">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="res\corner_venom_bottom_right.png">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="res\corner_venom_bottom_left.png">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="res\corner_charms_top_right.png">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="res\corner_charms_top_left.png">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="res\corner_charms_bottom_right.png">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="res\corner_charms_bottom_left.png">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="res\corner_darkcharms_top_right.png">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="res\corner_darkcharms_top_left.png">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="res\corner_darkcharms_bottom_right.png">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="res\corner_darkcharms_bottom_left.png">
       <Filter>Resource Files</Filter>
     </Image>
   </ItemGroup>

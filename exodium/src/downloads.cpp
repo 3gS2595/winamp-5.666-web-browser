@@ -340,6 +340,10 @@ void KeepWebViewForDownloads(Tab& tab) {
     SetTabMuted(kept, true);
 }
 
+bool TabHasDownloadsGoing(const Tab& tab) {
+    return HasDownloadsGoing(Identity(tab.webview.Get()).Get());
+}
+
 Download* FindDownload(int downloadId) noexcept {
     const auto found = std::ranges::find(g_app.downloads, downloadId, &Download::id);
     return found == g_app.downloads.end() ? nullptr : &*found;

@@ -39,6 +39,8 @@ bool g_comInitialized = false;
 constexpr ULONGLONG kWinampStartMs = 10000;
 // How long it has to have been done for: the windows it opens last follow the first.
 constexpr ULONGLONG kWinampSettleMs = 500;
+// How long a tab is left out of view before it is put to sleep, unless winamp.ini says otherwise.
+constexpr UINT kSleepTabsMinutes = 120;
 ULONGLONG g_loadedAt = 0;
 ULONGLONG g_lastStartingAt = 0;
 
@@ -58,16 +60,20 @@ ULONGLONG g_lastStartingAt = 0;
     return found;
 }
 
+} // namespace
+
 // Winamp's main window owns its other windows, so they all come forward whenever it
 // does, past a browser window, which it doesn't own. It does at start-up, as it comes
 // up and again as the splash screen goes. A window opened before then ends up behind
 // all of them.
-[[nodiscard]] bool WinampIsStarting() noexcept {
+bool WinampIsStarting() noexcept {
     const ULONGLONG now = ::GetTickCount64();
     if (now - g_loadedAt >= kWinampStartMs) return false;
     if (!::IsWindowVisible(g_app.winamp) || SplashIsUp()) g_lastStartingAt = now;
     return now - g_lastStartingAt < kWinampSettleMs;
 }
+
+namespace {
 
 // A link from exodium_open.exe, which keeps asking until a link is taken. It can arrive
 // whenever Winamp's thread takes messages, which may be in the middle of anything, so
@@ -89,6 +95,7 @@ LRESULT CALLBACK WinampProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, U
         if (copied.dwData == kOpenLinkCommand) return TakeLink(copied) ? kLinkTaken : 0;
     }
     if (OnClaudeSessionMessage(msg, wParam)) return 0;
+    if (OnExtensionsMessage(msg)) return 0;
     // Winamp started, stopped or paused: whether it plays the pages' sound may change.
     if (msg == WM_WA_IPC && lParam == IPC_CB_MISC && wParam == IPC_CB_MISC_STATUS) FollowPageSound();
 
@@ -118,7 +125,14 @@ int __cdecl Init() {
     // The frame's place is kept in winamp.ini, which Winamp knows the way to.
     g_app.winampIni = reinterpret_cast<const wchar_t*>(::SendMessageW(g_app.winamp, WM_WA_IPC, 0, IPC_GETINIFILEW));
     g_app.debuggingPort = ::GetPrivateProfileIntW(L"Exodium", L"remote_debugging_port", 0, g_app.winampIni);
+    // How long a tab is left out of view before it is put to sleep (sleeping_tabs.cpp): two
+    // hours, unless winamp.ini says another number of minutes, up to a week of them. Like
+    // the port, it is read here and isn't on the page; whether tabs are put to sleep at all is.
+    const UINT sleepMinutes =
+        ::GetPrivateProfileIntW(L"Exodium", L"sleep_tabs_minutes", kSleepTabsMinutes, g_app.winampIni);
+    g_app.sleepTabsAfterMs = static_cast<ULONGLONG>(std::clamp<UINT>(sleepMinutes, 1, 7 * 24 * 60)) * 60 * 1000;
     LoadSettings();
+    LoadDevToolsPrefs(); // where the DevTools are docked, and how large; kept there, though not on the page
 
     g_comInitialized = SUCCEEDED(::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
     const Gdiplus::GdiplusStartupInput gdiplusInput;
@@ -129,12 +143,19 @@ int __cdecl Init() {
 
     CreateTheme();
     RegisterWindowClasses();
-    g_app.history.Load(HistoryFile());
+    LoadHistory();
+    LoadBookmarks();
     g_app.zoom.Load(ZoomFile());
+    StartExtensions(); // before the browser process, which the first window starts
 
     ::SetWindowSubclass(g_app.winamp, WinampProc, kWinampSubclassId, 0);
     AddPreferencesPage();
     CreateBrowserWindow(false); // the first window, hidden until shown from Winamp's menu
+    RestoreSession();           // the windows and tabs open when Winamp last closed
+    StartSavingHistory();       // from here on, what is visited is on disk a moment later
+    StartSleepingTabs();        // and tabs left out of view long enough are put to sleep
+    AttachLibraryOrnaments();
+    StartRaisingDockedWindows();
     return GEN_INIT_SUCCESS;
 }
 

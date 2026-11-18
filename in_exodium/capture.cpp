@@ -2,6 +2,7 @@
 
 #include <audioclient.h>
 #include <audioclientactivationparams.h>
+#include <avrt.h>
 #include <mmdeviceapi.h>
 #include <tlhelp32.h>
 #include <wrl/client.h>
@@ -135,6 +136,11 @@ void SoundCapture::Stop() noexcept {
     give_ = nullptr;
 }
 
+SoundCapture::~SoundCapture() {
+    Stop();
+    if (source_) ::CloseHandle(source_);
+}
+
 DWORD WINAPI SoundCapture::ThreadMain(void* self) {
     const bool com = SUCCEEDED(::CoInitializeEx(nullptr, COINIT_MULTITHREADED));
     static_cast<SoundCapture*>(self)->Run();
@@ -143,6 +149,18 @@ DWORD WINAPI SoundCapture::ThreadMain(void* self) {
 }
 
 void SoundCapture::Run() {
+    // The visualizers are shown each packet a few tens of ms after it was recorded, and
+    // one that comes later than that leaves them with nothing to show. So the thread is
+    // scheduled as Windows' own audio threads are, ahead of a busy page or visualizer.
+    DWORD task = 0;
+    const HANDLE scheduled = ::AvSetMmThreadCharacteristicsW(L"Audio", &task);
+    struct Unscheduler {
+        HANDLE handle;
+        ~Unscheduler() {
+            if (handle) ::AvRevertMmThreadCharacteristics(handle);
+        }
+    } unschedule{scheduled};
+
     const HANDLE ready = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!ready) return;
     SoundBlocks blocks(gain_);
@@ -150,13 +168,10 @@ void SoundCapture::Run() {
     // Each time round is one recording, from opening it until it stops working, the
     // browser process goes, or the capture is stopped.
     do {
-        const HANDLE source = OpenWebViewBrowserProcess();
-        if (!source) continue;
-        struct Closer {
-            HANDLE handle;
-            ~Closer() { ::CloseHandle(handle); }
-        } closeSource{source};
-        const ComPtr<IAudioClient> client = OpenProcessLoopback(::GetProcessId(source), stop_);
+        if (source_ && ::WaitForSingleObject(source_, 0) != WAIT_TIMEOUT) ::CloseHandle(std::exchange(source_, nullptr));
+        if (!source_) source_ = OpenWebViewBrowserProcess();
+        if (!source_) continue;
+        const ComPtr<IAudioClient> client = OpenProcessLoopback(::GetProcessId(source_), stop_);
         if (!client) continue;
         // Process loopback has no format of its own to offer; it gives what it is asked for.
         WAVEFORMATEX format{};
@@ -177,7 +192,7 @@ void SoundCapture::Run() {
         blocks.Clear();
 
         bool working = true;
-        const HANDLE waits[] = {stop_, ready, source};
+        const HANDLE waits[] = {stop_, ready, source_};
         for (DWORD woke; working && (woke = ::WaitForMultipleObjects(3, waits, FALSE, kRetryMs)) != WAIT_OBJECT_0;) {
             if (woke == WAIT_OBJECT_0 + 2) break; // the browser process is gone
             UINT32 next = 0;

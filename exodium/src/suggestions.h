@@ -7,8 +7,13 @@
 // address or a search. Below it come the pages the typed words turn up in, best
 // first, and after them any past searches they turn up in. Up and Down try the
 // other rows out in the box.
+//
+// Bookmarks are offered along with the history, whether they have been visited or not.
+// A bookmark counts for as much as an address typed in once and lately, which is enough
+// for it to be filled in.
 #pragma once
 
+#include "bookmarks.h"
 #include "history.h"
 
 #include <cstddef>
@@ -24,10 +29,11 @@ inline constexpr std::size_t kMaxSuggestions = 8;
 
 // One row of the list under the address bar.
 struct Suggestion {
-    std::wstring text;   // what the address bar shows for it
-    std::wstring title;  // the page's title, when one is known
-    std::wstring url;    // where it goes
-    bool search = false; // a search for text with the engine in use, not a page
+    std::wstring text;       // what the address bar shows for it
+    std::wstring title;      // the page's title, when one is known
+    std::wstring url;        // where it goes
+    bool search = false;     // a search for text with the engine in use, not a page
+    bool bookmarked = false; // the page is a bookmark, which the list marks with a star
     double score = 0;
 };
 
@@ -39,6 +45,7 @@ struct SuggestionList {
 // The list for `typed`. `allowCompletion` lets the best address be filled in after
 // the caret; a deletion or a paste leaves the text as it stands.
 [[nodiscard]] SuggestionList BuildSuggestions(std::span<const HistoryEntry> history, std::wstring_view typed,
-                                              bool allowCompletion, std::int64_t now);
+                                              bool allowCompletion, std::int64_t now,
+                                              std::span<const Bookmark> bookmarks = {});
 
 } // namespace exodium

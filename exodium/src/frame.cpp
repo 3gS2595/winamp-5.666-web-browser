@@ -9,6 +9,8 @@
 #include <dwmapi.h>
 #include <windowsx.h>
 
+#include <algorithm>
+
 namespace exodium {
 
 namespace {
@@ -17,10 +19,22 @@ constexpr UINT_PTR kFrameSubclassId = 1;
 
 // Where a minimized window is parked, far off screen.
 constexpr int kMinimizedCoordinate = -32000;
-// The parts of Winamp's frame that act on a click: its title bar and its resize grip.
+// The parts of Winamp's frame that act on a click: its title bar and its close button.
 constexpr int kTitleBarHeight = 14;
 constexpr int kTitleBarButtonsWidth = 12;
-constexpr int kResizeGripSize = 20;
+// How far in from a frame's edges the mouse sizes it: about the width of Winamp's border on
+// the left, the right and the bottom, and a little of the title bar at the top. Along each
+// edge, the stretch nearest a corner sizes it from the corner, Winamp's resize grip included.
+constexpr int kSizingBorder = 8;
+constexpr int kSizingTop = 4;
+constexpr int kSizingCorner = 16;
+// The close button sits this far in from the title bar's top and right edges, which go on sizing the frame.
+constexpr int kCloseButtonMargin = 2;
+// How much smaller than the frame Winamp keeps the client whenever the frame changes size,
+// to fit it inside the border Winamp paints: 11 pixels on the left and 8 on the right,
+// 20 for the title bar and 14 at the bottom.
+constexpr int kWinampBorderAcross = 11 + 8;
+constexpr int kWinampBorderDown = 20 + 14;
 
 // What the Jump to File Extra plugin takes as leave to let a frame be moved.
 constexpr LPARAM kJumpToFileAllowMove = 2003;
@@ -61,16 +75,7 @@ void EnableSnapAndMaximize(HWND frame) noexcept {
                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }
 
-// Turns a maximized frame back into a normal window at `place` (screen coordinates).
-void RestoreFrameTo(HWND frame, const RECT& place) noexcept {
-    WINDOWPLACEMENT placement{.length = sizeof(placement)};
-    if (!::GetWindowPlacement(frame, &placement)) return;
-    placement.rcNormalPosition = place;
-    placement.showCmd = SW_SHOWNORMAL;
-    ::SetWindowPlacement(frame, &placement);
-    // A placement is measured from the work area's corner; this settles any difference.
-    ::SetWindowPos(frame, nullptr, place.left, place.top, Width(place), Height(place), SWP_NOZORDER | SWP_NOACTIVATE);
-}
+} // namespace
 
 // The Jump to File Extra plugin (gen_jumpex) hooks every embedded frame and, from the
 // moment one is activated until it is next clicked, strips the move out of any request
@@ -92,6 +97,8 @@ void SpendJumpToFileWidth(HWND frame) noexcept {
                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
 }
 
+namespace {
+
 // Winamp's title bar, as a caption: Windows does the dragging, and with it the
 // snapping to the screen's edges and corners and the dragging of a maximized window
 // back down to its size. Left to Winamp the frame was moved by hand and none of
@@ -103,26 +110,112 @@ void SpendJumpToFileWidth(HWND frame) noexcept {
     return point.y >= 0 && point.y < kTitleBarHeight && point.x >= 0 && point.x < client.right - kTitleBarButtonsWidth;
 }
 
-// Winamp sizes the frame by hand from its resize grip, which would leave a maximized
-// one still counted as maximized. It becomes a normal window first, where it is.
-void RestoreMaximizedForResize(HWND frame, LPARAM click) noexcept {
-    const RECT maximized = WindowRectOf(frame);
-    const int x = GET_X_LPARAM(click), y = GET_Y_LPARAM(click);
-    if (x > Width(maximized) - kResizeGripSize && y > Height(maximized) - kResizeGripSize) {
-        RestoreFrameTo(frame, maximized);
-    }
+// The edge or corner of the frame at a point on it, as the hit test code that has Windows size
+// it from there, as it sizes any other window. HTNOWHERE away from the edges, on Winamp's close
+// button, and on a frame that can't be sized that way: maximized, minimized or docked.
+[[nodiscard]] LRESULT SizingEdgeAt(HWND frame, POINT screenPoint) noexcept {
+    if (IsDockedIntoSkin(frame) || ::IsZoomed(frame) || ::IsIconic(frame)) return HTNOWHERE;
+    const RECT rect = WindowRectOf(frame);
+    const int x = screenPoint.x - rect.left, y = screenPoint.y - rect.top;
+    const int width = Width(rect), height = Height(rect);
+    if (x < 0 || y < 0 || x >= width || y >= height) return HTNOWHERE;
+    const bool closeButton = y >= kCloseButtonMargin && y < kTitleBarHeight && x >= width - kTitleBarButtonsWidth &&
+                             x < width - kCloseButtonMargin;
+    if (closeButton) return HTNOWHERE;
+
+    const bool left = x < kSizingBorder, right = x >= width - kSizingBorder;
+    const bool top = y < kSizingTop, bottom = y >= height - kSizingBorder;
+    const bool nearLeft = x < kSizingCorner, nearRight = x >= width - kSizingCorner;
+    const bool nearTop = y < kSizingCorner, nearBottom = y >= height - kSizingCorner;
+    if (nearRight && nearBottom) return HTBOTTOMRIGHT; // all of it, for Winamp's resize grip there
+    if ((left && nearTop) || (top && nearLeft)) return HTTOPLEFT;
+    if ((right && nearTop) || (top && nearRight)) return HTTOPRIGHT;
+    if ((left && nearBottom) || (bottom && nearLeft)) return HTBOTTOMLEFT;
+    if (left) return HTLEFT;
+    if (right) return HTRIGHT;
+    if (top) return HTTOP;
+    if (bottom) return HTBOTTOM;
+    return HTNOWHERE;
 }
 
-// Maximized means the work area exactly. Left to itself Windows adds the width of
-// the border the frame doesn't have and hangs its edges off screen.
-void FitMaximizedToWorkArea(HWND frame, MINMAXINFO& limits) noexcept {
+[[nodiscard]] constexpr bool IsSizingEdge(WPARAM hitTest) noexcept {
+    return hitTest >= HTLEFT && hitTest <= HTBOTTOMRIGHT;
+}
+
+// Puts the client where ClientPlace says, if it isn't there already. Winamp only fits
+// it to a change in the frame's size, so a frame maximized or put back without one
+// would otherwise keep the client as it was. A minimized frame is left alone, as
+// Winamp leaves it (see WM_WINDOWPOSCHANGED below).
+void PlaceClient(const BrowserWindow& win) noexcept {
+    if (!win.client || IsDockedIntoSkin(win.frame) || ::IsIconic(win.frame)) return;
+    const RECT place = ClientPlace(win);
+    RECT now = WindowRectOf(win.client);
+    ::MapWindowPoints(nullptr, win.frame, reinterpret_cast<POINT*>(&now), 2);
+    if (::EqualRect(&now, &place)) return;
+    ::SetWindowPos(win.client, nullptr, place.left, place.top, Width(place), Height(place),
+                   SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+enum class Side { kNone, kLeft, kTop, kRight, kBottom };
+
+// The side of a screen that a taskbar on it lies along. A taskbar that hides itself hangs off
+// that side, with a sliver of it left on the screen for the mouse to bring it back up by.
+[[nodiscard]] Side TaskbarSide(const RECT& screen) noexcept {
+    for (const wchar_t* name : {L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd"}) {
+        for (HWND bar = ::FindWindowExW(nullptr, nullptr, name, nullptr); bar;
+             bar = ::FindWindowExW(nullptr, bar, name, nullptr)) {
+            const RECT rect = WindowRectOf(bar);
+            if (RECT common{}; !::IntersectRect(&common, &rect, &screen)) continue;
+            if (Width(rect) >= Height(rect)) {
+                return rect.top + rect.bottom < screen.top + screen.bottom ? Side::kTop : Side::kBottom;
+            }
+            return rect.left + rect.right < screen.left + screen.right ? Side::kLeft : Side::kRight;
+        }
+    }
+    return Side::kNone;
+}
+
+} // namespace
+
+// Where a window maximized on a monitor goes: its work area. Left to itself Windows adds the
+// width of the border the frame doesn't have and hangs its edges off screen.
+//
+// Where nothing takes any of the screen for itself, as a taskbar that hides itself doesn't, the
+// work area is the whole screen. A window without a caption that covers all of it is taken for
+// a game or a video gone full screen: AltSnap leaves those alone, and Windows doesn't bring a
+// hidden taskbar up over one. A row of pixels is left uncovered on the taskbar's side, or at
+// the bottom, so that a maximized window isn't one.
+[[nodiscard]] RECT MaximizedPlace(const MONITORINFO& monitor) noexcept {
+    RECT place = monitor.rcWork;
+    if (!::EqualRect(&place, &monitor.rcMonitor)) return place;
+    switch (TaskbarSide(monitor.rcMonitor)) {
+    case Side::kLeft:
+        ++place.left;
+        break;
+    case Side::kTop:
+        ++place.top;
+        break;
+    case Side::kRight:
+        --place.right;
+        break;
+    case Side::kBottom:
+    case Side::kNone:
+        --place.bottom;
+        break;
+    }
+    return place;
+}
+
+void FitMaximized(HWND frame, MINMAXINFO& limits) noexcept {
     MONITORINFO monitor{.cbSize = sizeof(monitor)};
     if (!::GetMonitorInfoW(::MonitorFromWindow(frame, MONITOR_DEFAULTTONEAREST), &monitor)) return;
-    const RECT& work = monitor.rcWork;
-    limits.ptMaxPosition = {work.left - monitor.rcMonitor.left, work.top - monitor.rcMonitor.top};
-    limits.ptMaxSize = {Width(work), Height(work)};
+    const RECT place = MaximizedPlace(monitor);
+    limits.ptMaxPosition = {place.left - monitor.rcMonitor.left, place.top - monitor.rcMonitor.top};
+    limits.ptMaxSize = {Width(place), Height(place)};
     limits.ptMinTrackSize = kMinFrameSize;
 }
+
+namespace {
 
 LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR data) {
     BrowserWindow& win = *reinterpret_cast<BrowserWindow*>(data);
@@ -150,6 +243,7 @@ LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UI
         // Winamp only follows the frame's position when it does the moving itself.
         // Without this a move from outside is forgotten when the position is saved.
         if (!IsDockedIntoSkin(hwnd)) ::GetWindowRect(hwnd, &win.embedState.r);
+        PlaceClient(win);
         if (wasMinimized) LayoutActiveWebView(win);
         UpdateOrnaments(win); // they go where the frame's corners go, and out of sight when the frame does
         return result;
@@ -172,10 +266,26 @@ LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UI
         if (!IsDockedIntoSkin(hwnd)) return 0;
         break;
 
-    case WM_NCHITTEST:
-        if (!IsDockedIntoSkin(hwnd) && IsOnTitleBar(hwnd, {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)})) {
-            return HTCAPTION;
+    case WM_NCHITTEST: {
+        if (IsDockedIntoSkin(hwnd)) break;
+        const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (const LRESULT edge = SizingEdgeAt(hwnd, point); edge != HTNOWHERE) return edge;
+        if (IsOnTitleBar(hwnd, point)) return HTCAPTION;
+        break;
+    }
+
+    case WM_SETCURSOR:
+        // The arrows that say the window sizes from here. Winamp's frame never sized from its edges.
+        if (reinterpret_cast<HWND>(wParam) == hwnd && IsSizingEdge(LOWORD(lParam))) {
+            return ::DefWindowProcW(hwnd, msg, wParam, lParam);
         }
+        break;
+
+    case WM_NCLBUTTONDOWN:
+    case WM_NCLBUTTONDBLCLK:
+        // Windows sizes the frame from its edges and corners, as it does any window, and
+        // stretches it from the top of the screen to the bottom on a double click on either.
+        if (IsSizingEdge(wParam)) return ::DefWindowProcW(hwnd, msg, wParam, lParam);
         break;
 
     case WM_NCRBUTTONUP:
@@ -189,13 +299,9 @@ LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UI
 
     case WM_GETMINMAXINFO: {
         const LRESULT result = ::DefSubclassProc(hwnd, msg, wParam, lParam);
-        if (auto* limits = reinterpret_cast<MINMAXINFO*>(lParam)) FitMaximizedToWorkArea(hwnd, *limits);
+        if (auto* limits = reinterpret_cast<MINMAXINFO*>(lParam)) FitMaximized(hwnd, *limits);
         return result;
     }
-
-    case WM_LBUTTONDOWN:
-        if (::IsZoomed(hwnd)) RestoreMaximizedForResize(hwnd, lParam);
-        break;
 
     case WM_LBUTTONUP: {
         const LRESULT result = ::DefSubclassProc(hwnd, msg, wParam, lParam);
@@ -222,10 +328,13 @@ LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UI
     }
 
     case WM_SIZE:
-        if (win.client) {
+        if (!win.client) break;
+        if (IsDockedIntoSkin(hwnd)) {
             const RECT client = ClientRectOf(hwnd);
             ::SetWindowPos(win.client, nullptr, kFrameInsetLeft, kFrameInsetTop, client.right - kFrameInsetLeft,
                            client.bottom - kFrameInsetTop, SWP_NOZORDER | SWP_NOACTIVATE);
+        } else {
+            PlaceClient(win);
         }
         break;
 
@@ -240,6 +349,72 @@ LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UI
 }
 
 } // namespace
+
+bool IsMaximized(const BrowserWindow& win) noexcept {
+    return win.frame && !IsDockedIntoSkin(win.frame) && ::IsZoomed(win.frame);
+}
+
+LRESULT FrameSizingEdgeAt(const BrowserWindow& win, POINT screenPoint) noexcept {
+    return win.frame ? SizingEdgeAt(win.frame, screenPoint) : HTNOWHERE;
+}
+
+void RestoreWhereItIs(const BrowserWindow& win) noexcept {
+    if (!IsMaximized(win)) return;
+    const RECT place = WindowRectOf(win.frame);
+    WINDOWPLACEMENT placement{.length = sizeof(placement)};
+    MONITORINFO monitor{.cbSize = sizeof(monitor)};
+    if (!::GetWindowPlacement(win.frame, &placement) ||
+        !::GetMonitorInfoW(::MonitorFromWindow(win.frame, MONITOR_DEFAULTTONEAREST), &monitor)) {
+        return;
+    }
+    // A placement is measured from the corner of the work area, not of the screen.
+    placement.rcNormalPosition = place;
+    ::OffsetRect(&placement.rcNormalPosition, monitor.rcMonitor.left - monitor.rcWork.left,
+                 monitor.rcMonitor.top - monitor.rcWork.top);
+    placement.showCmd = SW_SHOWNORMAL;
+    ::SetWindowPlacement(win.frame, &placement);
+    // In case Windows measures it otherwise: the window stays exactly where it was.
+    ::SetWindowPos(win.frame, nullptr, place.left, place.top, Width(place), Height(place),
+                   SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+RECT NormalPlace(const BrowserWindow& win) noexcept {
+    if (!win.frame) return win.embedState.r;
+    WINDOWPLACEMENT placement{.length = sizeof(placement)};
+    if (IsDockedIntoSkin(win.frame) || (!::IsZoomed(win.frame) && !::IsIconic(win.frame)) ||
+        !::GetWindowPlacement(win.frame, &placement)) {
+        return WindowRectOf(win.frame);
+    }
+    // A placement is measured from the corner of the work area, not of the screen.
+    RECT place = placement.rcNormalPosition;
+    MONITORINFO monitor{.cbSize = sizeof(monitor)};
+    if (::GetMonitorInfoW(::MonitorFromRect(&place, MONITOR_DEFAULTTONEAREST), &monitor)) {
+        ::OffsetRect(&place, monitor.rcWork.left - monitor.rcMonitor.left, monitor.rcWork.top - monitor.rcMonitor.top);
+    }
+    return place;
+}
+
+RECT ClientPlace(const BrowserWindow& win) noexcept {
+    const RECT frame = ClientRectOf(win.frame); // the whole frame: it has no system border
+    // Maximized, the window has the screen to itself. Winamp's border goes from the left,
+    // the right and the bottom, and only its title bar stays.
+    if (IsMaximized(win)) return {0, kFrameInsetTop, frame.right, frame.bottom};
+    // Anywhere else, snapped to half the screen included, it stays inside the border,
+    // at the size Winamp gives it.
+    return {kFrameInsetLeft, kFrameInsetTop, kFrameInsetLeft + std::max<LONG>(0, frame.right - kWinampBorderAcross),
+            kFrameInsetTop + std::max<LONG>(0, frame.bottom - kWinampBorderDown)};
+}
+
+void KeepClientInPlace(const BrowserWindow& win, WINDOWPOS& position) noexcept {
+    constexpr UINT kStays = SWP_NOMOVE | SWP_NOSIZE;
+    if ((position.flags & kStays) == kStays || IsDockedIntoSkin(win.frame) || ::IsIconic(win.frame)) return;
+    const RECT place = ClientPlace(win);
+    position.x = place.left;
+    position.y = place.top;
+    position.cx = Width(place);
+    position.cy = Height(place);
+    position.flags &= ~kStays;
+}
 
 void AttachFrame(BrowserWindow& win) {
     // `win` outlives the subclass: DestroyBrowserWindow detaches before the window goes.

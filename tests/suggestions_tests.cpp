@@ -158,6 +158,54 @@ TEST_CASE(BetterMatchesComeFirst) {
     EXPECT_EQ(list.rows[2].url, L"https://one.example/mypage");
 }
 
+TEST_CASE(BookmarksAreSuggestedVisitedOrNot) {
+    Bookmarks bookmarks;
+    EXPECT(bookmarks.Add(L"https://threejs.org/docs/", L"three.js docs", kNow));
+    const auto suggest = [&bookmarks](const History& history, std::wstring_view typed) {
+        return BuildSuggestions(history.entries(), typed, true, kNow, bookmarks.entries());
+    };
+
+    // Never visited, it is filled in all the same: marking it says it is wanted.
+    const SuggestionList typed = suggest(History(), L"thr");
+    EXPECT_EQ(typed.inlineCompletion, L"eejs.org");
+    EXPECT_EQ(typed.rows[0].url, L"https://threejs.org/");
+
+    // By a word of its title, with its star.
+    const SuggestionList worded = suggest(History(), L"docs");
+    EXPECT_EQ(worded.rows.size(), std::size_t{2});
+    EXPECT_EQ(worded.rows[1].url, L"https://threejs.org/docs/");
+    EXPECT_EQ(worded.rows[1].title, L"three.js docs");
+    EXPECT(worded.rows[1].bookmarked);
+    EXPECT(!worded.rows[0].bookmarked);
+
+    // In the history as well, it is listed once, and before a page seen as often that isn't one.
+    History history;
+    history.RecordVisit(L"https://other.example/docs", L"Other docs", false, kNow);
+    history.RecordVisit(L"https://threejs.org/docs/", L"three.js docs", false, kNow);
+    const SuggestionList both = suggest(history, L"docs");
+    EXPECT_EQ(both.rows.size(), std::size_t{3});
+    EXPECT_EQ(both.rows[1].url, L"https://threejs.org/docs/");
+    EXPECT(both.rows[1].bookmarked);
+    EXPECT_EQ(both.rows[2].url, L"https://other.example/docs");
+    EXPECT(!both.rows[2].bookmarked);
+}
+
+TEST_CASE(SuggestionsFromALongHistoryAreTheSame) {
+    // Enough pages that the words turn up in thousands, of which the best are listed.
+    History history;
+    std::wstring text;
+    for (int i = 0; i < 5000; ++i)
+        text += std::format(L"https://site{}.example/page/{}\t1\t0\t{}\tPage {}\n", i, i, kNow, i);
+    text += std::format(L"https://best.example/page\t9\t2\t{}\tThe best page\n", kNow);
+    history = History::Parse(text);
+    const SuggestionList list = Suggest(history, L"page");
+    EXPECT_EQ(list.rows.size(), kMaxSuggestions);
+    EXPECT_EQ(list.rows[1].url, L"https://best.example/page");
+    // Those worth the same stay in the history's order, latest first.
+    EXPECT_EQ(list.rows[2].url, L"https://site0.example/page/0");
+    EXPECT_EQ(list.rows[3].url, L"https://site1.example/page/1");
+}
+
 TEST_CASE(ListIsCapped) {
     History history;
     for (int i = 0; i < 20; ++i) history.RecordVisit(std::format(L"https://site{}.example/page", i), L"", false, kNow);

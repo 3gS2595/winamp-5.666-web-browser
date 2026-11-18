@@ -244,7 +244,7 @@ void OnStandInRequested(int tabId, ICoreWebView2WebResourceRequestedEventArgs* a
     // A minimized window is a sliver parked off screen. The place it goes back to stands in for it.
     RECT place = ::IsIconic(from.frame) ? from.embedState.r : WindowRectOf(from.frame);
     ::OffsetRect(&place, kCascadeOffset, kCascadeOffset);
-    return CreateBrowserWindow(true, &place, true);
+    return CreateBrowserWindow(true, &place, true, from.isPrivate);
 }
 
 // Opens the copy in a new tab, placed the way a tab a link on the page opens is, and
@@ -281,6 +281,7 @@ void OpenHistoryCopy(int sourceTabId, HistoryCopy copy, OpenIn where) {
     added.openerId = openerId;
     added.forClaude = forClaude;
     added.claudeSession = claudeSession;
+    added.pages = copy;
     added.historyCopy = std::make_shared<HistoryCopyJob>(HistoryCopyJob{.copy = std::move(copy)});
     const int tabId = added.id;
     LayoutToolbarAndTabs(*host);
@@ -387,11 +388,54 @@ void StartHistoryCopy(int tabId) {
                                         }).Get());
 }
 
+void GiveTabPages(Tab& tab, HistoryCopy pages) {
+    if (pages.entries.empty() || pages.shown >= pages.entries.size()) return;
+    const SessionEntry& shown = pages.entries[pages.shown];
+    tab.title = shown.title.empty() ? shown.url : shown.title;
+    tab.pendingUrl = shown.url;
+    // Where it is said to be until the shown page has loaded, should it be closed first.
+    tab.lastUrl = shown.url;
+    // A page alone is only a page to go to.
+    if (pages.entries.size() > 1) tab.historyCopy = std::make_shared<HistoryCopyJob>(HistoryCopyJob{.copy = pages});
+    tab.pages = std::move(pages);
+}
+
 void EndHistoryCopy(Tab& tab) {
     if (!tab.historyCopy) return;
     StopStandIns(tab);
     tab.historyCopy.reset();
     tab.copyingHistory = false;
+}
+
+void DuplicateTab(BrowserWindow& win, int tabId) {
+    const int index = TabIndexById(win, tabId);
+    if (index < 0 || win.isFullscreen) return;
+    // What the new tab is given is taken before it is added, which may move the tabs in memory.
+    const Tab& source = win.tabs[index];
+    const std::wstring url = TabUrl(source);
+    HistoryCopy pages = source.pages;
+    // A tab whose pages haven't been heard of yet has the one it is on, at least.
+    if (pages.entries.empty() && CanCopyEntry(url)) {
+        pages.entries.push_back({.url = url, .title = source.title == kNewTabTitle ? std::wstring() : source.title});
+    }
+    const std::wstring title = source.title;
+    const bool forClaude = source.forClaude;
+    const std::uint32_t claudeSession = source.claudeSession;
+    const bool muted = source.muted;
+
+    // Brought into view, it starts afresh: the tabs opened before it no longer count as
+    // opened from anywhere. It counts as opened from the tab it is a copy of.
+    ForgetOpeners(win);
+    Tab& added = AddTab(win, title, index + 1);
+    added.pendingUrl = url.empty() ? HomePage() : url;
+    added.openerId = tabId;
+    added.forClaude = forClaude;
+    added.claudeSession = claudeSession;
+    added.muted = muted;
+    GiveTabPages(added, std::move(pages));
+    LayoutToolbarAndTabs(win);
+    // Its webview is made as it comes into view, and makes the pages its history.
+    SwitchToTab(win, index + 1);
 }
 
 } // namespace exodium

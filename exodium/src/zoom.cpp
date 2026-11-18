@@ -33,9 +33,10 @@ void ApplySiteZoom(Tab& tab) {
 
 void SetSiteZoom(Tab& tab, double factor) {
     const std::wstring host = TabHost(tab);
-    // A local file or the like, Claude's, or a stand-in while the tab's history is copied
-    // (back_forward.cpp), whose site isn't the one the tab will show: this tab only.
-    if (host.empty() || tab.forClaude || tab.copyingHistory) {
+    // A local file or the like, Claude's, a private window's, which leaves no word of the
+    // sites it was on, or a stand-in while the tab's history is copied (back_forward.cpp),
+    // whose site isn't the one the tab will show: this tab only.
+    if (host.empty() || tab.forClaude || tab.isPrivate || tab.copyingHistory) {
         SetTabZoom(tab, factor);
         return;
     }

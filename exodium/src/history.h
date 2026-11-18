@@ -1,5 +1,13 @@
 // The pages that have been visited, shared by every window: what the address bar
 // suggests from and what the history page lists.
+//
+// It is kept in two files. The history file has every entry, and is written whole: as
+// Winamp exits, and now and then while it runs. In between, what happens to the history
+// is added a line at a time to a journal beside it, which costs next to nothing to write,
+// so a Winamp that crashes or is cut off loses a couple of seconds of history and not the
+// whole run's. The next start reads the history file and then does what the journal says.
+// What is in here is the lines and what they mean; history_store.cpp reads and writes the
+// files.
 #pragma once
 
 #include <cstddef>
@@ -8,6 +16,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace exodium {
@@ -29,7 +38,9 @@ struct HistoryEntry {
 
 class History {
 public:
-    static constexpr std::size_t kMaxEntries = 2000;
+    // Some ten months of pages at seventy new ones a day. Until 2026-11-09 it was 2000,
+    // which that much browsing filled in a month.
+    static constexpr std::size_t kMaxEntries = 20000;
     static constexpr std::size_t kMaxTitleLength = 200;
 
     // Most recently visited first.
@@ -52,10 +63,36 @@ public:
     void Load(const std::filesystem::path& file);
     bool Save(const std::filesystem::path& file) const;
 
+    // ---- the journal ----
+
+    // A journal belongs to the history file as it was when the journal was begun, which
+    // its first line says by that file's `generation`: any text that is another for every
+    // time the file is written, such as when it was. A journal left over from another
+    // time's file would count its visits twice, or put old ones first.
+    [[nodiscard]] static std::wstring JournalHeader(std::wstring_view generation);
+    // Whether anything has happened that TakeJournal would give lines for.
+    [[nodiscard]] bool HasJournal(bool withTitles) const noexcept;
+    // The lines for what has happened since they were last taken: a visit counted or an
+    // entry removed, and with `withTitles` the titles given too. Those are held back to be
+    // taken less often, as some pages change theirs every second; only the last one a page
+    // was given is kept.
+    [[nodiscard]] std::wstring TakeJournal(bool withTitles);
+    // Nothing that has happened so far is to be given lines for: the history has just been
+    // written whole.
+    void ForgetJournal() noexcept;
+    // Does what a journal's lines say, if it is one that goes with `generation`; says
+    // whether it was. A last line that was cut short is left out, and so is any line that
+    // can't be read.
+    bool Replay(std::wstring_view journal, std::wstring_view generation);
+
 private:
     [[nodiscard]] std::vector<HistoryEntry>::iterator Locate(std::wstring_view url) noexcept;
+    void ForgetPendingTitle(std::wstring_view url) noexcept;
 
     std::vector<HistoryEntry> entries_;
+    std::wstring journal_;                                         // the lines not yet taken
+    std::vector<std::pair<std::wstring, std::wstring>> newTitles_; // an address and the title it was given
+    bool replaying_ = false; // what happens now is a journal's, and makes no lines
 };
 
 } // namespace exodium

@@ -21,6 +21,11 @@ inline constexpr wchar_t kParkedUrl[] = L"about:blank#exodium-closed";
 // an address that leads nowhere on the network. The address bar calls it kHistoryName.
 inline constexpr wchar_t kHistoryUrl[] = L"https://exodium.invalid/history";
 inline constexpr wchar_t kHistoryName[] = L"exodium://history";
+// The bookmarks page is made and served the same way.
+inline constexpr wchar_t kBookmarksUrl[] = L"https://exodium.invalid/bookmarks";
+inline constexpr wchar_t kBookmarksName[] = L"exodium://bookmarks";
+// What the address bar calls one of those pages, given its address; empty for any other.
+[[nodiscard]] std::wstring_view PluginPageName(std::wstring_view url) noexcept;
 
 // The page Claude Code's windows open on, tools\exodium_start.html, known by its name. It
 // has a new address each time and there is nothing on it to go back to.
@@ -33,8 +38,6 @@ inline constexpr wchar_t kToolStartPage[] = L"exodium_start.html";
 
 // Whether `url` is the kind of address the history keeps: http, https or file.
 [[nodiscard]] bool IsLikelyHttpUrl(std::wstring_view url) noexcept;
-// Whether `text` reads as a bare domain: no spaces, and a dot followed by letters.
-[[nodiscard]] bool LooksLikeDomain(std::wstring_view text) noexcept;
 
 // `text` as a URL component: UTF-8, with everything but unreserved characters escaped.
 [[nodiscard]] std::wstring PercentEncode(std::wstring_view text);
@@ -48,8 +51,20 @@ struct ResolvedInput {
     std::wstring url;
     bool isSearch = false;
 };
-// Where text entered in the address bar leads: a URL as it stands, a bare domain
-// over https, and anything else to a search for it.
+// Where text entered in the address bar leads, with nothing but the text to go by:
+//
+// - An address with its scheme, as it stands: "https://example.com", "edge://gpu",
+//   "about:blank". The name of one of the plugin's own pages is that page.
+// - The path of a file on this computer, "C:\pages\a.html", as a file address.
+// - A site's name without a scheme, over https, with whatever follows it:
+//   "example.com", "example.com:8443/a?b#c". Spaces may only come after the name:
+//   "example.com/a b" is an address and "example.com is down" a search.
+// - This computer and the ones beside it over http, which is all they serve as a rule:
+//   "localhost", "localhost:3000/app", "127.0.0.1:8000", "192.168.1.1/admin", "[::1]:8080",
+//   a name that ends in ".local" or the like, and a bare name with a port, "nas:8080".
+// - Anything else is searched for, an error message such as "TypeError: x is not a
+//   function" included, which reads as an address to Windows, and so is a name whose
+//   ending is a kind of file and no site's: "three.js", "notes.txt".
 [[nodiscard]] ResolvedInput ResolveAddressInput(std::wstring_view input);
 
 // Where a link handed to the browser from outside leads: a web or file address as it
@@ -69,7 +84,8 @@ struct UrlSpan {
 [[nodiscard]] UrlSpan SpanOf(std::wstring_view url) noexcept;
 
 // An address as the suggestion list shows it: from `bare` on, less the slash that
-// ends a bare host.
+// ends a bare host. ShownPart is the same as a part of `url` itself.
+[[nodiscard]] std::wstring_view ShownPart(std::wstring_view url, const UrlSpan& span) noexcept;
 [[nodiscard]] std::wstring ShownUrl(std::wstring_view url, const UrlSpan& span);
 
 // The host of a web address in lower case, "www." included. Empty for anything else.

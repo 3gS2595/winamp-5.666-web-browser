@@ -25,14 +25,20 @@ p { color: #969696; }
 .row button { flex: none; background: none; border: 0; color: #969696; font: inherit; cursor: pointer; visibility: hidden; }
 .row:hover button { visibility: visible; }
 .row button:hover { color: #fff; }
+#more { height: 1px; }
 </style></head><body>
 <input id="q" type="search" placeholder="Search history" autofocus>
 <div id="list"></div>
+<div id="more"></div>
 <script>
 const entries = [)html";
 
+// The history can hold many thousands of pages, so the list is made a stretch at a time:
+// the first of them at once, and more whenever the end of the list scrolls into sight.
 constexpr std::wstring_view kPageTail = LR"html(];
-const list = document.getElementById('list'), q = document.getElementById('q');
+const list = document.getElementById('list'), q = document.getElementById('q'), more = document.getElementById('more');
+const stretch = 200;
+let words = [], next = 0, heading = null, shown = 0;
 function add(parent, tag, cls, text) {
   const e = document.createElement(tag);
   e.className = cls; e.textContent = text;
@@ -40,34 +46,52 @@ function add(parent, tag, cls, text) {
   return e;
 }
 function host(url) { try { return new URL(url).hostname; } catch (e) { return ''; } }
-function show() {
-  const words = q.value.toLowerCase().split(/\s+/).filter(Boolean);
-  list.textContent = '';
-  let heading = null;
-  for (const entry of entries) {
-    const [url, title, when] = entry;
-    const text = (title + ' ' + url).toLowerCase();
-    if (!words.every(w => text.includes(w))) continue;
-    const at = when ? new Date(when * 1000) : null;
-    const day = at ? at.toLocaleDateString([], { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) : 'Earlier';
-    if (day !== heading) add(list, 'h2', '', heading = day);
-    const row = add(list, 'div', 'row', '');
-    add(row, 'span', 'time', at ? at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '');
-    const link = add(row, 'a', '', title || url);
-    link.href = url; link.title = url;
-    add(row, 'span', 'host', host(url));
-    const remove = add(row, 'button', '', '✕');
-    remove.title = 'Remove from history';
-    remove.onclick = () => {
-      chrome.webview.postMessage(url);
-      entries.splice(entries.indexOf(entry), 1);
-      show();
-    };
-  }
-  if (!list.firstChild) add(list, 'p', '', entries.length ? 'Nothing in the history matches.' : 'The history is empty.');
+function addRow(entry) {
+  const [url, title, when] = entry;
+  const at = when ? new Date(when * 1000) : null;
+  const day = at ? at.toLocaleDateString([], { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) : 'Earlier';
+  if (day !== heading) add(list, 'h2', '', heading = day);
+  const row = add(list, 'div', 'row', '');
+  add(row, 'span', 'time', at ? at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '');
+  const link = add(row, 'a', '', title || url);
+  link.href = url; link.title = url;
+  add(row, 'span', 'host', host(url));
+  const remove = add(row, 'button', '', '✕');
+  remove.title = 'Remove from history';
+  remove.onclick = () => {
+    chrome.webview.postMessage(url);
+    entries.splice(entries.indexOf(entry), 1);
+    show(shown - 1);
+  };
 }
-q.oninput = show;
-show();
+// Adds rows until `count` more are there, or the history has no more that match.
+function fill(count) {
+  for (const until = shown + count; next < entries.length && shown < until; ++next) {
+    const entry = entries[next];
+    if (words.length) {
+      const text = (entry[1] + ' ' + entry[0]).toLowerCase();
+      if (!words.every(w => text.includes(w))) continue;
+    }
+    addRow(entry);
+    ++shown;
+  }
+}
+// Makes the list again from the top, with `count` rows to begin with.
+function show(count) {
+  words = q.value.toLowerCase().split(/\s+/).filter(Boolean);
+  list.textContent = '';
+  next = 0; heading = null; shown = 0;
+  fill(Math.max(count, stretch));
+  if (!shown) add(list, 'p', '', entries.length ? 'Nothing in the history matches.' : 'The history is empty.');
+}
+// The end of the list is in sight, or nearly: more of it, until it isn't.
+function fillInSight() {
+  fill(stretch);
+  if (next < entries.length && more.getBoundingClientRect().top < innerHeight + 600) requestAnimationFrame(fillInSight);
+}
+new IntersectionObserver(seen => { if (seen.some(s => s.isIntersecting)) fillInSight(); }, { rootMargin: '600px' }).observe(more);
+q.oninput = () => show(stretch);
+show(stretch);
 </script></body></html>)html";
 
 } // namespace

@@ -17,16 +17,56 @@ using Microsoft::WRL::Callback;
 using ControllerCompletedHandler = ICoreWebView2CreateCoreWebView2ControllerCompletedHandler;
 using EnvironmentCompletedHandler = ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler;
 
+// Extensions are on, for Bitwarden (extensions.cpp).
+//
 // Tools outside the browser, such as Claude Code, drive it over the DevTools protocol on
 // the port winamp.ini names. There is none unless it does: anything running on this
 // machine can use that port, and with it every site the browser is signed in to.
 [[nodiscard]] ComPtr<ICoreWebView2EnvironmentOptions> EnvironmentOptions() {
-    if (g_app.debuggingPort == 0) return nullptr;
     auto options = Microsoft::WRL::Make<CoreWebView2EnvironmentOptions>();
-    const std::wstring arguments = L"--remote-debugging-port=" + std::to_wstring(g_app.debuggingPort);
-    options->put_AdditionalBrowserArguments(arguments.c_str());
+    if (ComPtr<ICoreWebView2EnvironmentOptions6> options6; SUCCEEDED(options.As(&options6))) {
+        options6->put_AreBrowserExtensionsEnabled(TRUE);
+    }
+    if (g_app.debuggingPort != 0) {
+        const std::wstring arguments = L"--remote-debugging-port=" + std::to_wstring(g_app.debuggingPort);
+        options->put_AdditionalBrowserArguments(arguments.c_str());
+    }
     return options;
 }
+
+// The profile a tab's webview is made in.
+struct TabProfile {
+    bool forClaude = false; // Claude's own, which has none of the user's sign-ins, site data or extensions
+    bool isPrivate = false; // the private session of the profile, which keeps nothing
+};
+[[nodiscard]] TabProfile ProfileOf(const Tab& tab) noexcept {
+    return {.forClaude = tab.forClaude, .isPrivate = tab.isPrivate};
+}
+
+// Makes a webview for a tab: in Claude's own profile for one of Claude's, in the private
+// session for a tab of a private window, and in the user's profile for the rest. A runtime
+// too old to have profiles gives Claude or a private window no webview at all, rather than
+// one in the user's profile.
+HRESULT CreateController(HWND parent, TabProfile profile,
+                         ICoreWebView2CreateCoreWebView2ControllerCompletedHandler* done) {
+    if (!profile.forClaude && !profile.isPrivate) return g_app.environment->CreateCoreWebView2Controller(parent, done);
+    ComPtr<ICoreWebView2Environment10> environment10;
+    ComPtr<ICoreWebView2ControllerOptions> options;
+    if (FAILED(g_app.environment.As(&environment10)) ||
+        FAILED(environment10->CreateCoreWebView2ControllerOptions(&options)) ||
+        (profile.forClaude && FAILED(options->put_ProfileName(kClaudeProfile))) ||
+        (profile.isPrivate && FAILED(options->put_IsInPrivateModeEnabled(TRUE)))) {
+        return E_NOINTERFACE;
+    }
+    return environment10->CreateCoreWebView2ControllerWithOptions(parent, options.Get(), done);
+}
+
+// Whether a page asked for one of an extension's own windows: Bitwarden's are "popouts".
+// Extensions can't say what size they asked for, so they get Bitwarden's popup's.
+[[nodiscard]] bool IsExtensionPopout(std::wstring_view url) noexcept {
+    return url.starts_with(L"chrome-extension://") && url.contains(L"uilocation=popout");
+}
+constexpr SIZE kPopoutSize{480, 630};
 
 // Makes the environment if there is none yet, then calls `onReady`. Callers that
 // arrive while it is being made wait for the same one.
@@ -40,7 +80,7 @@ void WithEnvironment(std::move_only_function<void()> onReady) {
     g_app.environmentPending = true;
 
     const auto failed = [](HRESULT result) {
-        TraceFailure(L"Creating the WebView2 environment", result);
+        LogFailure(L"Creating the WebView2 environment", result);
         g_app.environmentPending = false;
         g_app.environmentWaiters.clear(); // whoever asks next tries again
     };
@@ -73,23 +113,11 @@ void AdoptController(BrowserWindow& win, Tab& tab, ICoreWebView2Controller* cont
     controller->put_IsVisible(FALSE);
 }
 
-// Pages are asked for their dark version, to go with the rest of the window.
-void PreferDarkColorScheme(ICoreWebView2* webview) {
-    ComPtr<ICoreWebView2_13> webview13;
-    ComPtr<ICoreWebView2Profile> profile;
-    ComPtr<ICoreWebView2Profile2> profile2;
-    if (FAILED(webview->QueryInterface(IID_PPV_ARGS(&webview13))) || FAILED(webview13->get_Profile(&profile)) ||
-        !profile || FAILED(profile.As(&profile2))) {
-        return;
-    }
-    profile2->put_PreferredColorScheme(COREWEBVIEW2_PREFERRED_COLOR_SCHEME_DARK);
-}
-
 void OnTabControllerCreated(int tabId, HWND createdIn, HRESULT result, ICoreWebView2Controller* controller) {
     const TabLocation at = FindTab(tabId);
     if (at) at.tab().creating = false;
     if (FAILED(result) || !controller) {
-        TraceFailure(L"Creating a WebView2 controller", FAILED(result) ? result : E_FAIL);
+        LogFailure(L"Creating a WebView2 controller", FAILED(result) ? result : E_FAIL);
         return;
     }
     if (!at) { // the tab was closed while this was pending
@@ -101,10 +129,22 @@ void OnTabControllerCreated(int tabId, HWND createdIn, HRESULT result, ICoreWebV
     Tab& tab = at.tab();
     AdoptController(win, tab, controller, createdIn);
     PreferDarkColorScheme(tab.webview.Get());
+    // The extensions are the user's profile's: not Claude's, and not a private window's.
+    if (!tab.forClaude && !tab.isPrivate) LoadExtensions(tab.webview.Get());
+    // A tab muted before it had this webview, as one that was asleep, is muted still.
+    if (tab.muted) SetTabMuted(tab, true);
     WireTabEvents(tabId);
     // A tab opened from Back or Forward makes its history first; see back_forward.cpp.
-    if (tab.historyCopy) StartHistoryCopy(tabId);
-    else tab.webview->Navigate(tab.pendingUrl.empty() ? HomePage().c_str() : tab.pendingUrl.c_str());
+    if (tab.historyCopy) {
+        StartHistoryCopy(tabId);
+    } else {
+        const std::wstring& url = tab.pendingUrl.empty() ? HomePage() : tab.pendingUrl;
+        if (const HRESULT asked = tab.webview->Navigate(url.c_str()); FAILED(asked)) {
+            LogFailure(tab.isPrivate ? std::wstring(L"Going to an address in a private window")
+                                     : L"Going to " + url.substr(0, 200),
+                       asked);
+        }
+    }
 
     if (at.isActive()) {
         LayoutActiveWebView(win);
@@ -140,6 +180,17 @@ void OnTabControllerCreated(int tabId, HWND createdIn, HRESULT result, ICoreWebV
         popup.size = SIZE{static_cast<LONG>(width), static_cast<LONG>(height)};
     }
     return popup;
+}
+
+// The window a tab a page opened goes into: the opener's, unless that is out of sight.
+// WebView2 hands what an extension opens to a webview of the extension's profile, which
+// may be the first window's, hidden until it is shown from Winamp's menu. Then it goes to
+// the window of the user's nearest the front, or else the opener's is shown.
+[[nodiscard]] BrowserWindow& WindowInSight(BrowserWindow& opener) {
+    if (::IsWindowVisible(opener.frame)) return opener;
+    if (BrowserWindow* const front = FrontUserWindow()) return *front;
+    ::ShowWindow(opener.frame, SW_SHOWNA);
+    return opener;
 }
 
 // How long after the page's context menu was opened on a link a request for that link
@@ -179,6 +230,31 @@ std::wstring SourceOf(ICoreWebView2* webview) {
     return ComString(webview, &ICoreWebView2::get_Source).value_or(std::wstring());
 }
 
+HRESULT CreateWebViewInProfile(HWND parent, const wchar_t* profileName, bool isPrivate,
+                               ICoreWebView2CreateCoreWebView2ControllerCompletedHandler* done) {
+    ComPtr<ICoreWebView2Environment10> environment10;
+    ComPtr<ICoreWebView2ControllerOptions> options;
+    if (!g_app.environment || FAILED(g_app.environment.As(&environment10)) ||
+        FAILED(environment10->CreateCoreWebView2ControllerOptions(&options)) ||
+        FAILED(options->put_ProfileName(profileName)) ||
+        (isPrivate && FAILED(options->put_IsInPrivateModeEnabled(TRUE)))) {
+        return E_NOINTERFACE;
+    }
+    return environment10->CreateCoreWebView2ControllerWithOptions(parent, options.Get(), done);
+}
+
+// Pages are asked for their dark version, to go with the rest of the window.
+void PreferDarkColorScheme(ICoreWebView2* webview) {
+    ComPtr<ICoreWebView2_13> webview13;
+    ComPtr<ICoreWebView2Profile> profile;
+    ComPtr<ICoreWebView2Profile2> profile2;
+    if (FAILED(webview->QueryInterface(IID_PPV_ARGS(&webview13))) || FAILED(webview13->get_Profile(&profile)) ||
+        !profile || FAILED(profile.As(&profile2))) {
+        return;
+    }
+    profile2->put_PreferredColorScheme(COREWEBVIEW2_PREFERRED_COLOR_SCHEME_DARK);
+}
+
 void SetTabMuted(Tab& tab, bool muted) {
     ComPtr<ICoreWebView2_8> webview8;
     if (tab.webview && SUCCEEDED(tab.webview.As(&webview8))) webview8->put_IsMuted(muted ? TRUE : FALSE);
@@ -191,6 +267,28 @@ void UpdateTabAudio(Tab& tab) {
     if (std::exchange(tab.playingAudio, playing != FALSE) == (playing != FALSE)) return;
     if (tab.button) ::InvalidateRect(tab.button.get(), nullptr, FALSE);
     FollowPageSound();
+}
+
+void TabIntoPage(BrowserWindow& win, bool backward) {
+    Tab* const tab = ActiveTab(win);
+    if (tab && tab->controller) {
+        // The webview takes it as a Tab that reached it from outside: forward to the first
+        // thing on its page that takes the keyboard, backward to the last.
+        tab->controller->MoveFocus(backward ? COREWEBVIEW2_MOVE_FOCUS_REASON_PREVIOUS
+                                            : COREWEBVIEW2_MOVE_FOCUS_REASON_NEXT);
+        return;
+    }
+    // Its webview is still being made, as just after Ctrl+T. The keyboard waits in the
+    // window, out of the address bar, and the page is given it as it comes
+    // (OnTabControllerCreated).
+    ::SetFocus(win.client);
+}
+
+void ReloadTab(Tab& tab, bool pastCache) {
+    // One with no webview, not looked at yet or asleep, loads when it is looked at.
+    if (!tab.webview) return;
+    if (pastCache) tab.webview->CallDevToolsProtocolMethod(L"Page.reload", L"{\"ignoreCache\":true}", nullptr);
+    else tab.webview->Reload();
 }
 
 void MoveFocusToWebView(Tab& tab) {
@@ -220,8 +318,8 @@ void CreateWebViewForTab(BrowserWindow& owner, int tabId) {
         StartTabSpinners(*at.window);
 
         const HWND parent = at.window->client;
-        const HRESULT started = g_app.environment->CreateCoreWebView2Controller(
-            parent,
+        const HRESULT started = CreateController(
+            parent, ProfileOf(tab),
             Callback<ControllerCompletedHandler>([tabId, parent](HRESULT result,
                                                                  ICoreWebView2Controller* controller) -> HRESULT {
                 OnTabControllerCreated(tabId, parent, result, controller);
@@ -236,13 +334,31 @@ void CreateWebViewForTab(BrowserWindow& owner, int tabId) {
 // only works if we give WebView2 a real CoreWebView2 via put_NewWindow — a plain new
 // tab leaves window.open() returning null and breaks those sign-in flows. The same
 // holds whether the webview ends up in a tab of this window or in a window of its own.
-void OpenRequestedWindow(BrowserWindow& win, int sourceTabId, ICoreWebView2NewWindowRequestedEventArgs* request) {
+void OpenRequestedWindow(BrowserWindow& opener, int sourceTabId, ICoreWebView2NewWindowRequestedEventArgs* request) {
+    // Bitwarden's window for unlocking, from the "Unlock account" in its menu in a page, is
+    // its popup under the toolbar button instead, in the window the page is in: that one
+    // goes again once the vault is unlocked, and gives the page the keyboard back, which
+    // Bitwarden's own window can't be made to do in WebView2.
+    const TabLocation asker = FindTab(sourceTabId);
+    if (IsBitwardenUnlockPopout(ComString(request, &ICoreWebView2NewWindowRequestedEventArgs::get_Uri).value_or(L"")) &&
+        !(asker && (asker.tab().forClaude || asker.tab().isPrivate)) &&
+        OpenBitwardenPopupToUnlock(WindowInSight(opener))) {
+        request->put_Handled(TRUE);
+        return;
+    }
+
     ComPtr<ICoreWebView2NewWindowRequestedEventArgs> args(request);
     ComPtr<ICoreWebView2Deferral> deferral;
     args->GetDeferral(&deferral);
 
-    // The tab goes into the opener's window, unless the page asked for a window.
-    const std::optional<PopupRequest> popup = RequestedPopup(request);
+    // The tab goes into the opener's window, unless the page asked for a window. An
+    // extension's own window, such as one Bitwarden pops out, is one it asked for.
+    std::optional<PopupRequest> popup = RequestedPopup(request);
+    if (!popup &&
+        IsExtensionPopout(ComString(request, &ICoreWebView2NewWindowRequestedEventArgs::get_Uri).value_or(L""))) {
+        popup = PopupRequest{.size = kPopoutSize};
+    }
+    BrowserWindow& win = popup ? opener : WindowInSight(opener);
     BrowserWindow* const popupWindow = popup ? CreatePopupWindow(win, *popup) : nullptr;
     const bool isPopup = popupWindow != nullptr;
     BrowserWindow& host = isPopup ? *popupWindow : win;
@@ -257,11 +373,14 @@ void OpenRequestedWindow(BrowserWindow& win, int sourceTabId, ICoreWebView2NewWi
     const TabLocation source = FindTab(sourceTabId);
     const bool forClaude = source && source.tab().forClaude;
     const std::uint32_t claudeSession = source ? source.tab().claudeSession : 0;
+    // The page that asked for it says which profile it is in, and it is as private as that page.
+    const TabProfile profile = source ? ProfileOf(source.tab()) : TabProfile{};
     Tab& added = AddTab(host, kNewTabTitle, index);
     added.creating = true;
     added.openerId = openerId;
     added.forClaude = forClaude;
     added.claudeSession = claudeSession;
+    added.isPrivate = profile.isPrivate;
     const int tabId = added.id;
     LayoutToolbarAndTabs(host);
 
@@ -301,8 +420,9 @@ void OpenRequestedWindow(BrowserWindow& win, int sourceTabId, ICoreWebView2NewWi
         args->put_Handled(TRUE);
         if (deferral) deferral->Complete();
     };
-    const HRESULT started = g_app.environment->CreateCoreWebView2Controller(
-        parent,
+    // In the opener's profile, which the new page has to be in to be given to it.
+    const HRESULT started = CreateController(
+        parent, profile,
         Callback<ControllerCompletedHandler>([finish](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
             finish(result, controller);
             return S_OK;
@@ -313,22 +433,18 @@ void OpenRequestedWindow(BrowserWindow& win, int sourceTabId, ICoreWebView2NewWi
 // Each tab gives up its dead webview and is left as a tab is before it is first
 // looked at, headed for the page it was on. The tabs in view get a new one at once
 // and the rest when they are switched to. Where Back and Forward led went with the
-// process.
+// process, so each is given its pages again, which its new webview makes its history.
 void ReviveWebViews() {
     g_app.reviving = false;
     for (const auto& win : g_app.windows) {
         ExitVideoFullscreen(*win);
-        for (Tab& tab : win->tabs) {
-            tab.CloseWebView();
-            if (!tab.lastUrl.empty()) tab.pendingUrl = tab.lastUrl;
-            tab.loading = tab.typedNav = tab.parked = tab.crashed = false;
-            tab.typedNavId = 0;
-            tab.zoom = SiteZoom::kNormal; // a new webview starts out at the normal size
-        }
+        for (Tab& tab : win->tabs) PutTabToSleep(tab);
         UpdateReloadButton(*win);
+        LayoutActiveWebView(*win); // the DevTools docked in it went with the page they were for
     }
     for (ClosedTab& closed : g_app.closedTabs) DiscardClosedWebView(closed);
     AbandonDownloads();
+    ForgetExtensions();        // the next webview of the user's profile looks at them afresh
     g_app.environment.Reset(); // it belonged to the dead process; the next webview asked for makes a new one
 
     for (const auto& win : g_app.windows) {

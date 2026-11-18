@@ -3,14 +3,13 @@
 // the tests can run it.
 //
 // Winamp plays the pages' sound while a page makes sound and Winamp would otherwise be
-// stopped. It stops once the pages have been quiet for a while, so a pause between two
-// videos doesn't stop it. Whatever the user does in Winamp goes: if they stop it, or
-// play something else, it isn't started again until the pages have gone quiet and then
-// make sound again.
+// stopped, and stops as soon as the pages go quiet, which WebView2 says some 0.3 s after
+// the sound stops. It doesn't wait to see whether more sound comes, as after one video
+// before the next: it used to wait 3 s, and Winamp went on playing a paused page that long
+// (the user found it too slow, 2026-11-06). The next sound starts it again. Whatever the
+// user does in Winamp goes: if they stop it, or play something else, it isn't started
+// again until the pages have gone quiet and then make sound again.
 #pragma once
-
-#include <cstdint>
-#include <optional>
 
 namespace exodium {
 
@@ -22,16 +21,12 @@ struct SoundSituation {
     bool audible = false; // a page in an open window makes sound
     bool ours = false;    // what Winamp plays, or is paused on, is the pages' sound
     WinampPlayback winamp = WinampPlayback::kStopped;
-    std::uint64_t nowMs = 0; // a clock that only goes forward, such as GetTickCount64
 };
 
 enum class SoundStep { kNothing, kStart, kStop };
 
 class SoundRule {
 public:
-    // How long the pages must stay quiet before Winamp stops.
-    static constexpr std::uint64_t kQuietMs = 3000;
-
     // What to do now. Winamp's playing having been the pages' sound at the last look and
     // not being now is taken for the user's doing, since the rule only ever starts or stops
     // it by the steps it gives, and is told of them by Did.
@@ -45,7 +40,6 @@ public:
 private:
     bool wasOurs_ = false;
     bool declined_ = false;
-    std::optional<std::uint64_t> quietSince_; // while Winamp plays the pages' sound and they are quiet
 };
 
 } // namespace exodium

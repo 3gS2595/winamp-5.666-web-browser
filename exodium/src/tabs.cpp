@@ -71,20 +71,124 @@ void RefreshAfterTabsRemoved(BrowserWindow& win, int activeId) {
 // Puts a closing tab's webview away instead of closing it. The page is left for
 // kParkedUrl, which unloads it. A page that asks whether to leave stays where it is
 // and is only kept quiet.
-void ParkClosedTab(Tab&& tab, std::wstring url) {
+void ParkClosedTab(Tab&& tab, ClosedTab&& closed) {
     tab.controller->put_IsVisible(FALSE);
     SetTabMuted(tab, true);
     tab.parked = true;
     tab.webview->Navigate(kParkedUrl);
-    g_app.closedTabs.push_back({.url = std::move(url), .tab = std::move(tab)});
+    closed.tab = std::move(tab);
+    g_app.closedTabs.push_back(std::move(closed));
 
     std::size_t kept = 0;
-    for (ClosedTab& closed : g_app.closedTabs | std::views::reverse) {
-        if (closed.tab.controller && ++kept > kClosedTabsKept) DiscardClosedWebView(closed);
+    for (ClosedTab& earlier : g_app.closedTabs | std::views::reverse) {
+        if (earlier.tab.controller && ++kept > kClosedTabsKept) DiscardClosedWebView(earlier);
+    }
+    TrimClosedTabs();
+}
+
+// The pages a closing tab is reopened with: those it had, or else the page it was on.
+[[nodiscard]] HistoryCopy PagesToReopen(const Tab& tab, const std::wstring& url) {
+    if (!tab.pages.entries.empty()) return tab.pages;
+    const std::wstring title = tab.title == kNewTabTitle ? std::wstring() : tab.title;
+    return {.entries = {{.url = url, .title = title}}};
+}
+
+// Puts a closed tab back at the end of a window's strip, out of view.
+void PutBackClosedTab(BrowserWindow& win, ClosedTab&& closed) {
+    // Put away on kParkedUrl, its webview lost the pages that were ahead of the one it was
+    // on, as any page does that goes somewhere new. Its pages have them, and it is made
+    // again from them, Forward and all.
+    if (closed.tab.controller && closed.pages.shown + 1 < closed.pages.entries.size()) DiscardClosedWebView(closed);
+    if (!closed.tab.controller) {
+        Tab& tab = AddTab(win, closed.title.empty() ? closed.url : closed.title);
+        tab.pendingUrl = closed.url;
+        GiveTabPages(tab, std::move(closed.pages));
+        return;
+    }
+    // Its webview is still there: the tab comes back as it was, and a step back from
+    // the page it was put away on is the page it was closed on.
+    closed.tab.controller->put_ParentWindow(win.client);
+    Tab& tab = win.tabs.emplace_back(std::move(closed.tab));
+    tab.controller->NotifyParentWindowPositionChanged();
+    tab.seenAt = ::GetTickCount64(); // not left out of view all the while it was closed
+    tab.askingToSleep = false;       // whatever its page was asked then, the answer found no tab
+    SetTabMuted(tab, tab.muted);     // heard again, unless the user had muted it
+    // Whether it is making sound may have changed while it was closed, when its
+    // events couldn't find it in any window.
+    UpdateTabAudio(tab);
+    // Anywhere else and it never left its page, or is still on the way out, which
+    // the tab's navigation handlers see to.
+    if (SourceOf(tab.webview.Get()) == kParkedUrl) {
+        tab.parked = false;
+        tab.webview->GoBack();
     }
 }
 
+// Puts closed tabs back at the end of a window's strip, side by side, and brings the one
+// at `shown` among them into view.
+void PutBackClosedTabs(BrowserWindow& win, std::vector<ClosedTab>&& closed, std::size_t shown) {
+    if (closed.empty()) return;
+    shown = std::min(shown, closed.size() - 1);
+    const int first = TabCount(win);
+    const std::wstring shownUrl = closed[shown].url;
+    for (ClosedTab& tab : closed) PutBackClosedTab(win, std::move(tab));
+    LayoutToolbarAndTabs(win);
+    const int index = first + static_cast<int>(shown);
+    SwitchToTab(win, index);
+    // Its webview may be on its way back from the page it was put away on, and say that is where it is.
+    if (const Tab* tab = ActiveTab(win); tab && tab->webview && SourceOf(tab->webview.Get()) == kParkedUrl) {
+        ShowPageUrl(win, shownUrl);
+    }
+}
+
+// A window closed whole comes back whole: in a window of its own at the place it had, or
+// in `win` if all it has is a tab that hasn't been anywhere, which goes.
+void ReopenClosedWindow(BrowserWindow& win, const ClosedWindow& closedWindow, std::vector<ClosedTab>&& closed) {
+    std::ranges::sort(closed, {}, &ClosedTab::indexInWindow);
+    // The tab that was in view, or the nearest one that came back after it.
+    std::size_t shown = 0;
+    while (shown + 1 < closed.size() && closed[shown].indexInWindow < closedWindow.activeIndex) ++shown;
+
+    if (IsBlankWindow(win)) {
+        Tab blank = std::move(win.tabs.front());
+        win.tabs.clear();
+        win.active = -1;
+        KeepWebViewForDownloads(blank);
+        PutBackClosedTabs(win, std::move(closed), shown);
+        return;
+    }
+    const RECT place = KeptOnScreen(closedWindow.place);
+    BrowserWindow* const host = CreateBrowserWindow(true, &place, true);
+    if (!host) return;
+    PutBackClosedTabs(*host, std::move(closed), shown);
+    ::ShowWindow(host->frame, closedWindow.maximized ? SW_SHOWMAXIMIZED : SW_SHOWNA);
+    ::SetForegroundWindow(host->frame);
+}
+
 } // namespace
+
+void TrimClosedTabs() {
+    std::vector<ClosedTab>& closed = g_app.closedTabs;
+    std::size_t items = 0;
+    for (std::size_t i = closed.size(); i-- > 0;) {
+        // The tabs of a window closed whole are one item.
+        const bool sameAsNext = i + 1 < closed.size() && closed[i].window && closed[i].window == closed[i + 1].window;
+        if (sameAsNext || ++items <= kClosedItemsKept) continue;
+        for (std::size_t j = 0; j <= i; ++j) DiscardClosedWebView(closed[j]);
+        closed.erase(closed.begin(), closed.begin() + static_cast<std::ptrdiff_t>(i + 1));
+        return;
+    }
+}
+
+bool IsBlankTab(const Tab& tab) {
+    // Opened on the home page, which may have sent it on, and gone nowhere else since.
+    return (tab.pendingUrl.empty() || tab.pendingUrl == HomePage()) && tab.pages.entries.size() <= 1 &&
+           !tab.historyCopy && !tab.forClaude;
+}
+
+bool IsBlankWindow(const BrowserWindow& win) {
+    return win.tabs.size() == 1 && !win.isFullscreen && IsBlankTab(win.tabs.front());
+}
 
 void CloseTabs(BrowserWindow& win, const std::vector<int>& tabIds) {
     if (std::ranges::all_of(win.tabs, [&](const Tab& tab) { return IsOneOf(tabIds, tab.id); })) {
@@ -168,6 +272,11 @@ void ActivateTab(BrowserWindow& win, int index) {
     if (win.isFullscreen) return; // the active tab's controller is parented elsewhere right now
     if (!IsTabIndex(win, index) || win.active == index) return;
 
+    // The tab that goes out of view was in view until now, and so is the one that comes in.
+    const ULONGLONG now = ::GetTickCount64();
+    if (Tab* const leaving = ActiveTab(win)) leaving->seenAt = now;
+    win.tabs[index].seenAt = now;
+
     HideAllWebViews(win);
     win.active = index;
     ShowTabInStrip(win, index);
@@ -236,6 +345,26 @@ void PrevTab(BrowserWindow& win) {
     NoteUserSwitch(win, fromTabId);
 }
 
+void SwitchToTabByNumber(BrowserWindow& win, int number) {
+    if (win.tabs.empty() || number < 1) return;
+    // Nine is the last tab, however many there are; a number past the end is no tab's.
+    const int index = number >= 9 ? TabCount(win) - 1 : number - 1;
+    if (!IsTabIndex(win, index) || index == win.active) return;
+    const int fromTabId = ActiveTabId(win);
+    SwitchToTab(win, index);
+    NoteUserSwitch(win, fromTabId);
+}
+
+std::wstring TabUrl(const Tab& tab) {
+    // A tab still making the history it was given is on a stand-in, and says where it is headed.
+    if (tab.webview && !tab.copyingHistory) {
+        std::wstring source = SourceOf(tab.webview.Get());
+        // A webview that has shown nothing yet is on a blank page of its own.
+        if (!source.empty() && source != L"about:blank") return source;
+    }
+    return !tab.lastUrl.empty() ? tab.lastUrl : tab.pendingUrl;
+}
+
 void NewTab(BrowserWindow& win, std::wstring_view url) {
     const int index = TabCount(win);
     AddTab(win, kNewTabTitle).pendingUrl = url;
@@ -244,12 +373,13 @@ void NewTab(BrowserWindow& win, std::wstring_view url) {
     ::PostMessageW(win.client, kMsgInitWebView, 0, 0);
 }
 
-void RemoveTab(BrowserWindow& win, int index) {
+void RemoveTab(BrowserWindow& win, int index, const ClosedWith& with) {
     if (win.isFullscreen && win.tabs[index].id == win.fullscreenTabId) LeaveVideoFullscreen(win);
 
     Tab tab = std::move(win.tabs[index]);
     win.tabs.erase(win.tabs.begin() + index);
     tab.button.reset();
+    tab.devtools = {}; // its DevTools, if they were docked beside it, close with it
     EndHistoryCopy(tab);
     PassOnOpener(win, tab);
     tab.openerId = 0; // reopened, it starts afresh
@@ -259,18 +389,29 @@ void RemoveTab(BrowserWindow& win, int index) {
                               : tab.webview        ? SourceOf(tab.webview.Get())
                                                    : tab.pendingUrl;
 
+    ClosedTab closed{.url = closingUrl,
+                     .title = tab.title,
+                     .pages = PagesToReopen(tab, closingUrl),
+                     .window = with.window,
+                     .indexInWindow = with.index};
+
     // Tools on the debugging port see every webview there is. One put away would show up
-    // to them as a page, and one closed by a tool would never be seen to go.
-    if (!closingUrl.empty() && tab.controller && tab.webview && !win.closing && g_app.debuggingPort == 0) {
+    // to them as a page, and one closed by a tool would never be seen to go. A private
+    // window's tab isn't kept in any way: closed, it is gone.
+    if (!closingUrl.empty() && tab.controller && tab.webview && !win.closing && g_app.debuggingPort == 0 &&
+        !tab.isPrivate) {
         // A tab that got as far as showing a page can be reopened, so it is put away
         // rather than closed.
-        ParkClosedTab(std::move(tab), std::move(closingUrl));
+        ParkClosedTab(std::move(tab), std::move(closed));
         return;
     }
-    // Reopening it starts over at its address. Claude's tabs aren't the user's to reopen:
+    // Reopening it makes its pages again. Claude's tabs aren't the user's to reopen:
     // they close when its session ends, and Ctrl+Shift+T would bring them back instead
     // of the tab the user closed.
-    if (!closingUrl.empty() && !tab.forClaude) g_app.closedTabs.push_back({.url = std::move(closingUrl)});
+    if (!closingUrl.empty() && !tab.forClaude && !tab.isPrivate) {
+        g_app.closedTabs.push_back(std::move(closed));
+        TrimClosedTabs();
+    }
     // A webview can't be kept past the window it is in: WebView2 closes it when that
     // window is destroyed. The webviews of a window closed for good go with it, which
     // frees all they held at once. Any other webview goes with `tab`.
@@ -290,48 +431,43 @@ void CloseActiveTab(BrowserWindow& win) {
 }
 
 void ReopenLastClosedTab(BrowserWindow& win) {
-    if (g_app.closedTabs.empty()) return;
-    ClosedTab closed = std::move(g_app.closedTabs.back());
-    g_app.closedTabs.pop_back();
-    if (!closed.tab.controller) {
-        NewTab(win, closed.url);
-        return;
-    }
+    // The tabs kept to be brought back are the other windows', and stay out of a private one.
+    if (g_app.closedTabs.empty() || win.isPrivate) return;
+    // A window closed whole has its tabs side by side at the end.
+    const std::shared_ptr<const ClosedWindow> window = g_app.closedTabs.back().window;
+    std::vector<ClosedTab> closed;
+    do {
+        closed.push_back(std::move(g_app.closedTabs.back()));
+        g_app.closedTabs.pop_back();
+    } while (window && !g_app.closedTabs.empty() && g_app.closedTabs.back().window == window);
 
-    // Its webview is still there: the tab comes back as it was, and a step back from
-    // the page it was put away on is the page it was closed on.
-    closed.tab.controller->put_ParentWindow(win.client);
-    const int index = TabCount(win);
-    win.tabs.push_back(std::move(closed.tab));
-    LayoutToolbarAndTabs(win);
-    SwitchToTab(win, index);
-
-    Tab& tab = win.tabs[index];
-    tab.controller->NotifyParentWindowPositionChanged();
-    SetTabMuted(tab, false);
-    // Whether it is making sound may have changed while it was closed, when its
-    // events couldn't find it in any window.
-    UpdateTabAudio(tab);
-    // Anywhere else and it never left its page, or is still on the way out, which
-    // the tab's navigation handlers see to.
-    if (SourceOf(tab.webview.Get()) == kParkedUrl) {
-        tab.parked = false;
-        tab.webview->GoBack();
-        ShowPageUrl(win, closed.url);
-    }
+    if (window) ReopenClosedWindow(win, *window, std::move(closed));
+    else PutBackClosedTabs(win, std::move(closed), 0);
 }
 
-// Ctrl+H: the history page, in the tab that already shows it if there is one.
-void OpenHistory(BrowserWindow& win) {
-    const auto showsHistory = [](const Tab& tab) { return tab.lastUrl == kHistoryUrl && tab.webview; };
-    if (const auto found = std::ranges::find_if(win.tabs, showsHistory); found != win.tabs.end()) {
+namespace {
+
+// One of the plugin's own pages, in the tab that already shows it if there is one.
+void OpenPluginPage(BrowserWindow& win, std::wstring_view url) {
+    const auto showsIt = [url](const Tab& tab) { return tab.lastUrl == url && tab.webview; };
+    if (const auto found = std::ranges::find_if(win.tabs, showsIt); found != win.tabs.end()) {
         SwitchToTab(win, static_cast<int>(found - win.tabs.begin()));
         found->webview->Reload(); // it may have been made a while ago
         return;
     }
     // An address bar that is being typed in would otherwise keep the keyboard and its text.
     if (::GetFocus() == win.urlEdit) ::SetFocus(win.client);
-    NewTab(win, kHistoryUrl);
+    NewTab(win, url);
+}
+
+} // namespace
+
+void OpenHistory(BrowserWindow& win) {
+    OpenPluginPage(win, kHistoryUrl);
+}
+
+void OpenBookmarks(BrowserWindow& win) {
+    OpenPluginPage(win, kBookmarksUrl);
 }
 
 // Tabs can be dragged along their strip to reorder them, onto another window's strip
@@ -375,6 +511,7 @@ void MoveTabs(BrowserWindow& src, const std::vector<int>& tabIds, BrowserWindow&
             tab.controller->put_IsVisible(FALSE);
             tab.controller->put_ParentWindow(dst.client);
         }
+        MoveDevToolsTo(tab, dst.client); // docked beside its page, they go where it goes
     }
 
     if (src.tabs.empty()) CloseBrowserWindow(src); // its last tabs were dragged away
@@ -393,6 +530,7 @@ void MoveTabs(BrowserWindow& src, const std::vector<int>& tabIds, BrowserWindow&
     for (int i = insertAt; i < insertAt + count; ++i) {
         selected[i] = true;
         if (dst.tabs[i].controller) dst.tabs[i].controller->NotifyParentWindowPositionChanged();
+        DevToolsMoved(dst.tabs[i]);
     }
     ApplySelection(dst, selected);
 }

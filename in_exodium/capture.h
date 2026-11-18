@@ -29,7 +29,7 @@ public:
     SoundCapture() = default;
     SoundCapture(const SoundCapture&) = delete;
     SoundCapture& operator=(const SoundCapture&) = delete;
-    ~SoundCapture() { Stop(); }
+    ~SoundCapture();
 
     // Starts recording, on a thread of its own. It keeps at it for as long as it runs:
     // until there is a WebView2 browser process, and again after one goes and another
@@ -46,6 +46,10 @@ private:
 
     HANDLE thread_ = nullptr;
     HANDLE stop_ = nullptr;
+    // The WebView2 browser process last recorded, kept from one start to the next: finding
+    // it again means looking through every process there is, which took 11 ms of the time
+    // from a page making sound to the visualizers showing it (measured 2026-11-07).
+    HANDLE source_ = nullptr;
     Give give_;
     int gain_ = 1;
 };

@@ -13,15 +13,104 @@ TEST_CASE(RecognisesAddressesTheHistoryKeeps) {
     EXPECT(!IsLikelyHttpUrl(L""));
 }
 
-TEST_CASE(RecognisesBareDomains) {
-    EXPECT(LooksLikeDomain(L"example.com"));
-    EXPECT(LooksLikeDomain(L"sub.example.museum"));
-    EXPECT(!LooksLikeDomain(L"example"));
-    EXPECT(!LooksLikeDomain(L"two words.com"));
-    EXPECT(!LooksLikeDomain(L"example.c"));
-    EXPECT(!LooksLikeDomain(L"example.c0m"));
-    EXPECT(!LooksLikeDomain(L"example."));
-    EXPECT(!LooksLikeDomain(L""));
+namespace {
+
+// Where typed text leads, and "search" for text that is searched for.
+std::wstring Typed(std::wstring_view text) {
+    const ResolvedInput resolved = ResolveAddressInput(text);
+    return resolved.isSearch ? L"search" : resolved.url;
+}
+
+} // namespace
+
+TEST_CASE(SitesTypedWithoutASchemeAreAskedOverHttps) {
+    EXPECT_EQ(Typed(L"example.com"), L"https://example.com");
+    EXPECT_EQ(Typed(L"sub.example.museum"), L"https://sub.example.museum");
+    EXPECT_EQ(Typed(L"www.example.com"), L"https://www.example.com");
+    EXPECT_EQ(Typed(L"example.com."), L"https://example.com.");
+    EXPECT_EQ(Typed(L"b\u00FCcher.de"), L"https://b\u00FCcher.de");
+    EXPECT_EQ(Typed(L"xn--bcher-kva.xn--p1ai"), L"https://xn--bcher-kva.xn--p1ai");
+    // With whatever follows the name: until 2026-11-09 a path made it a search.
+    EXPECT_EQ(Typed(L"github.com/anthropics/claude-code"), L"https://github.com/anthropics/claude-code");
+    EXPECT_EQ(Typed(L"en.wikipedia.org/wiki/Winamp"), L"https://en.wikipedia.org/wiki/Winamp");
+    EXPECT_EQ(Typed(L"example.com/a.b/c?d=e.f#g"), L"https://example.com/a.b/c?d=e.f#g");
+    EXPECT_EQ(Typed(L"example.com?q=1"), L"https://example.com?q=1");
+    EXPECT_EQ(Typed(L"example.com:8443/app"), L"https://example.com:8443/app");
+    // Spaces may come after the name, where they are part of the address.
+    EXPECT_EQ(Typed(L"example.com/a page"), L"https://example.com/a page");
+}
+
+TEST_CASE(ThisComputerAndItsNeighboursAreAskedOverHttp) {
+    EXPECT_EQ(Typed(L"localhost"), L"http://localhost");
+    EXPECT_EQ(Typed(L"LocalHost:3000"), L"http://LocalHost:3000");
+    EXPECT_EQ(Typed(L"localhost:5173/index.html"), L"http://localhost:5173/index.html");
+    EXPECT_EQ(Typed(L"localhost/app?x=1"), L"http://localhost/app?x=1");
+    EXPECT_EQ(Typed(L"127.0.0.1"), L"http://127.0.0.1");
+    EXPECT_EQ(Typed(L"127.0.0.1:8000"), L"http://127.0.0.1:8000");
+    EXPECT_EQ(Typed(L"192.168.1.1/admin"), L"http://192.168.1.1/admin");
+    EXPECT_EQ(Typed(L"[::1]"), L"http://[::1]");
+    EXPECT_EQ(Typed(L"[::1]:8080/x"), L"http://[::1]:8080/x");
+    EXPECT_EQ(Typed(L"printer.local"), L"http://printer.local");
+    EXPECT_EQ(Typed(L"app.localhost:3000"), L"http://app.localhost:3000");
+    // A bare name is a word, unless a port says it is a computer's.
+    EXPECT_EQ(Typed(L"nas:8080"), L"http://nas:8080");
+    EXPECT_EQ(Typed(L"nas"), L"search");
+    EXPECT_EQ(Typed(L"nas/files"), L"search");
+}
+
+TEST_CASE(AddressesWithTheirSchemeAreTakenAsTheyStand) {
+    EXPECT_EQ(Typed(L"https://example.com/a?b=c"), L"https://example.com/a?b=c");
+    EXPECT_EQ(Typed(L"HTTP://localhost:3000"), L"HTTP://localhost:3000");
+    EXPECT_EQ(Typed(L"file:///C:/page.html"), L"file:///C:/page.html");
+    EXPECT_EQ(Typed(L"edge://gpu"), L"edge://gpu");
+    EXPECT_EQ(Typed(L"chrome-extension://abcdefgh/popup.html"), L"chrome-extension://abcdefgh/popup.html");
+    EXPECT_EQ(Typed(L"about:blank"), L"about:blank");
+    EXPECT_EQ(Typed(L"view-source:https://example.com"), L"view-source:https://example.com");
+    EXPECT_EQ(Typed(L"EXODIUM://History"), kHistoryUrl);
+    EXPECT_EQ(Typed(L"exodium://bookmarks"), kBookmarksUrl);
+    // A file on this computer, by its path.
+    EXPECT_EQ(Typed(LR"(C:\My Pages\page.html)"), L"file:///C:/My%20Pages/page.html");
+    EXPECT_EQ(Typed(LR"(\\server\share\page.html)"), L"file://server/share/page.html");
+}
+
+TEST_CASE(WhatIsNoAddressIsSearchedFor) {
+    EXPECT_EQ(Typed(L"hello world"), L"search");
+    EXPECT_EQ(Typed(L"example"), L"search");
+    EXPECT_EQ(Typed(L"example.com is down"), L"search");
+    EXPECT_EQ(Typed(L"two words.com"), L"search");
+    EXPECT_EQ(Typed(L"what is c++"), L"search");
+    // Windows reads anything like "word:" as an address with a scheme, and until
+    // 2026-11-09 so did the address bar: an error message pasted in went nowhere.
+    EXPECT_EQ(Typed(L"error: cannot find module"), L"search");
+    EXPECT_EQ(Typed(L"TypeError: x is not a function"), L"search");
+    EXPECT_EQ(Typed(L"note:"), L"search");
+    EXPECT_EQ(Typed(L"std::vector"), L"search");
+    EXPECT_EQ(Typed(L"16:9"), L"search");
+    EXPECT_EQ(Typed(L"localhost:port"), L"search");
+    EXPECT_EQ(Typed(L"example.com:99999"), L"search");
+    // Script addresses are not run on the address bar's say-so.
+    EXPECT_EQ(Typed(L"javascript:alert(1)"), L"search");
+    // Numbers, mail addresses, and names that end as files and no sites do.
+    EXPECT_EQ(Typed(L"1.5"), L"search");
+    EXPECT_EQ(Typed(L"v2.0"), L"search");
+    EXPECT_EQ(Typed(L"1.2.3"), L"search");
+    EXPECT_EQ(Typed(L"example.c"), L"search");
+    EXPECT_EQ(Typed(L"example.c0m"), L"search");
+    EXPECT_EQ(Typed(L"someone@example.com"), L"search");
+    EXPECT_EQ(Typed(L"three.js"), L"search");
+    EXPECT_EQ(Typed(L"notes.txt"), L"search");
+    EXPECT_EQ(Typed(L"three.js docs"), L"search");
+
+    const ResolvedInput search = ResolveAddressInput(L"hello world");
+    EXPECT_EQ(search.url, L"https://www.google.com/search?q=hello%20world");
+    EXPECT(search.isSearch);
+}
+
+TEST_CASE(ThePluginsOwnPagesHaveNames) {
+    EXPECT_EQ(PluginPageName(kHistoryUrl), std::wstring_view(kHistoryName));
+    EXPECT_EQ(PluginPageName(kBookmarksUrl), std::wstring_view(kBookmarksName));
+    EXPECT(PluginPageName(L"https://example.com/").empty());
+    EXPECT(PluginPageName(L"").empty());
 }
 
 TEST_CASE(PercentEncodesEverythingReserved) {
@@ -120,6 +209,7 @@ TEST_CASE(FindsThePartsOfAnAddress) {
 TEST_CASE(ShowsAddressesWithoutSchemeOrWww) {
     const std::wstring_view front = L"https://www.example.com/";
     EXPECT_EQ(ShownUrl(front, SpanOf(front)), L"example.com");
+    EXPECT_EQ(ShownPart(front, SpanOf(front)), std::wstring_view(L"example.com"));
     const std::wstring_view deep = L"https://example.com/a/";
     EXPECT_EQ(ShownUrl(deep, SpanOf(deep)), L"example.com/a/");
     const std::wstring_view local = L"file:///C:/page.html";

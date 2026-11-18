@@ -43,8 +43,24 @@ std::filesystem::path HistoryFile() {
     return DataDir() / L"history.txt";
 }
 
+std::filesystem::path HistoryJournalFile() {
+    return DataDir() / L"history.journal";
+}
+
+std::filesystem::path BookmarksFile() {
+    return DataDir() / L"bookmarks.txt";
+}
+
+std::filesystem::path LogFile() {
+    return DataDir() / L"exodium.log";
+}
+
 std::filesystem::path ZoomFile() {
     return DataDir() / L"zoom.txt";
+}
+
+std::filesystem::path SessionFile() {
+    return DataDir() / L"session.txt";
 }
 
 std::filesystem::path OpenerProgram() {

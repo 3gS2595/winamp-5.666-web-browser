@@ -32,7 +32,10 @@ void OnTitleChanged(int tabId, ICoreWebView2* sender) {
     const auto title = ComString(sender, &ICoreWebView2::get_DocumentTitle);
     if (!title) return;
     UpdateTabTitle(*at.window, at.index, *title);
-    g_app.history.SetTitle(SourceOf(sender), *title);
+    const std::wstring source = SourceOf(sender);
+    // Nothing a private window shows goes into the history, a title no more than a visit.
+    if (!at.tab().isPrivate) g_app.history.SetTitle(source, *title);
+    NoteTabTitle(at.tab(), source, *title);
 }
 
 void OnNavigationStarting(int tabId, ICoreWebView2NavigationStartingEventArgs* args) {
@@ -62,6 +65,7 @@ void OnSourceChanged(int tabId, ICoreWebView2* sender) {
     const TabLocation at = FindTab(tabId);
     if (!at || !sender || at.tab().copyingHistory) return;
     ApplySiteZoom(at.tab());
+    if (at.isActive()) UpdateBookmarkButton(*at.window); // the star is for the page in view
     if (!at.isActive() || IsEditingUrl(*at.window)) return;
     if (const auto source = ComString(sender, &ICoreWebView2::get_Source)) ShowPageUrl(*at.window, *source);
 }
@@ -92,14 +96,17 @@ void OnNavigationCompleted(int tabId, ICoreWebView2* sender, ICoreWebView2Naviga
         if (args) args->get_IsSuccess(&succeeded);
         if (succeeded) {
             const std::wstring title = ComString(sender, &ICoreWebView2::get_DocumentTitle).value_or(std::wstring());
-            g_app.history.RecordVisit(*url, title, typed, UnixNow());
+            if (!tab.isPrivate) g_app.history.RecordVisit(*url, title, typed, UnixNow());
             if (std::exchange(tab.crashed, false)) InvalidateTabButton(tab);
         }
         if (at.isActive() && !IsEditingUrl(win)) ShowPageUrl(win, *url);
     }
 
     tab.loading = false;
-    if (at.isActive()) UpdateReloadButton(win);
+    if (at.isActive()) {
+        UpdateReloadButton(win);
+        UpdateBookmarkButton(win);
+    }
 }
 
 void OnNewWindowRequested(int tabId, ICoreWebView2NewWindowRequestedEventArgs* args) {
@@ -112,11 +119,13 @@ void OnNewWindowRequested(int tabId, ICoreWebView2NewWindowRequestedEventArgs* a
     OpenRequestedWindow(*at.window, tabId, args);
 }
 
-// The webview shows its context menu itself. All that is wanted of it here is the link
-// it was opened on, if any: see OpensBehind in webview.cpp.
+// The webview shows its context menu itself. What is wanted of it here is the link it
+// was opened on, if any: see OpensBehind in webview.cpp. And its "Inspect" opens the
+// DevTools docked in the window, where they can be: see devtools_panel.cpp.
 void OnContextMenuRequested(int tabId, ICoreWebView2ContextMenuRequestedEventArgs* args) {
     const TabLocation at = FindTab(tabId);
     if (!at || !args) return;
+    OfferDockedInspect(tabId, args);
     Tab& tab = at.tab();
     tab.menuLink.clear();
     ComPtr<ICoreWebView2ContextMenuTarget> target;
@@ -137,18 +146,19 @@ void OnWindowCloseRequested(int tabId) {
     }
 }
 
-// Requests for kHistoryUrl never reach the network; the page is made here, afresh
-// for every visit, and no other page may show it in a frame. A tab copying another's
-// history hears of every page it asks for (see back_forward.cpp), and the history is
-// no other address's to be given.
-void OnHistoryPageRequested(ICoreWebView2WebResourceRequestedEventArgs* args) {
+// Requests for kHistoryUrl and kBookmarksUrl never reach the network; the page is made
+// here, afresh for every visit, and no other page may show it in a frame. A tab copying
+// another's history hears of every page it asks for (see back_forward.cpp), and the
+// history and the bookmarks are no other address's to be given.
+void OnPluginPageRequested(ICoreWebView2WebResourceRequestedEventArgs* args) {
     if (!args || !g_app.environment) return;
     ComPtr<ICoreWebView2WebResourceRequest> request;
-    if (FAILED(args->get_Request(&request)) ||
-        ComString(request.Get(), &ICoreWebView2WebResourceRequest::get_Uri) != kHistoryUrl) {
-        return;
-    }
-    const std::string html = ToUtf8(BuildHistoryPageHtml(g_app.history.entries()));
+    if (FAILED(args->get_Request(&request))) return;
+    const auto uri = ComString(request.Get(), &ICoreWebView2WebResourceRequest::get_Uri);
+    std::string html;
+    if (uri == kHistoryUrl) html = ToUtf8(BuildHistoryPageHtml(g_app.history.entries()));
+    else if (uri == kBookmarksUrl) html = ToUtf8(BookmarksPageHtml());
+    else return;
 
     ComPtr<IStream> body;
     body.Attach(::SHCreateMemStream(reinterpret_cast<const BYTE*>(html.data()), static_cast<UINT>(html.size())));
@@ -159,17 +169,86 @@ void OnHistoryPageRequested(ICoreWebView2WebResourceRequestedEventArgs* args) {
     }
 }
 
-// The history page names an entry to remove by sending its address. No other page
-// gets a say in what the history holds.
-void OnWebMessage(ICoreWebView2WebMessageReceivedEventArgs* args) {
-    if (ComString(args, &ICoreWebView2WebMessageReceivedEventArgs::get_Source) != kHistoryUrl) return;
-    const auto url = ComString(args, &ICoreWebView2WebMessageReceivedEventArgs::TryGetWebMessageAsString);
-    if (url && g_app.history.Remove(*url)) g_app.history.Save(HistoryFile());
+// The history page names an entry to remove by sending its address, and the bookmarks
+// page says what was clicked on it (bookmarks.h). No other page gets a say in what the
+// history or the bookmarks hold.
+void OnWebMessage(ICoreWebView2* sender, ICoreWebView2WebMessageReceivedEventArgs* args) {
+    const auto source = ComString(args, &ICoreWebView2WebMessageReceivedEventArgs::get_Source);
+    if (source != kHistoryUrl && source != kBookmarksUrl) return;
+    const auto message = ComString(args, &ICoreWebView2WebMessageReceivedEventArgs::TryGetWebMessageAsString);
+    if (!message) return;
+    if (source == kBookmarksUrl) {
+        OnBookmarksPageMessage(sender, *message);
+    } else if (g_app.history.Remove(*message)) {
+        SaveHistorySoon(true); // on disk at once: it was taken out to be gone
+    }
+}
+
+// What ended a process, for the log.
+[[nodiscard]] std::wstring_view NameOf(COREWEBVIEW2_PROCESS_FAILED_REASON reason) noexcept {
+    switch (reason) {
+    case COREWEBVIEW2_PROCESS_FAILED_REASON_UNEXPECTED:
+        return L"it ended unexpectedly";
+    case COREWEBVIEW2_PROCESS_FAILED_REASON_UNRESPONSIVE:
+        return L"it stopped answering";
+    case COREWEBVIEW2_PROCESS_FAILED_REASON_TERMINATED:
+        return L"it was ended from outside";
+    case COREWEBVIEW2_PROCESS_FAILED_REASON_CRASHED:
+        return L"it crashed";
+    case COREWEBVIEW2_PROCESS_FAILED_REASON_LAUNCH_FAILED:
+        return L"it couldn't be started";
+    case COREWEBVIEW2_PROCESS_FAILED_REASON_OUT_OF_MEMORY:
+        return L"it ran out of memory";
+    default:
+        return L"for a reason not known";
+    }
+}
+
+// Writes down that a process of the browser's ended, which process and why. The pages'
+// own are frequent enough in a long day to be worth a look when one page keeps doing it.
+void LogProcessFailure(int tabId, COREWEBVIEW2_PROCESS_FAILED_KIND kind, ICoreWebView2ProcessFailedEventArgs* args) {
+    std::wstring what;
+    switch (kind) {
+    case COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED:
+        // Every webview says so; once is enough.
+        if (g_app.reviving) return;
+        what = L"The browser process ended, and every page with it";
+        break;
+    case COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED:
+    case COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE: {
+        what = kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED ? L"A page's process ended"
+                                                                              : L"A page stopped answering";
+        // With the site it was on, which tells one page that keeps doing it from another;
+        // but not a private window's, of which nothing is written down.
+        if (const TabLocation at = FindTab(tabId)) {
+            what.append(L" (")
+                .append(at.tab().isPrivate ? L"in a private window" : HostOf(TabUrl(at.tab())))
+                .append(L")");
+        }
+        break;
+    }
+    case COREWEBVIEW2_PROCESS_FAILED_KIND_GPU_PROCESS_EXITED:
+        what = L"The graphics process ended";
+        break;
+    default:
+        what = L"A helper process of the browser's ended";
+        break;
+    }
+    COREWEBVIEW2_PROCESS_FAILED_REASON reason{};
+    int exitCode = 0;
+    if (ComPtr<ICoreWebView2ProcessFailedEventArgs2> more; SUCCEEDED(args->QueryInterface(IID_PPV_ARGS(&more)))) {
+        if (SUCCEEDED(more->get_Reason(&reason))) what.append(L": ").append(NameOf(reason));
+        if (SUCCEEDED(more->get_ExitCode(&exitCode))) {
+            what.append(L", exit code 0x").append(ToHex(static_cast<unsigned long>(exitCode), 8));
+        }
+    }
+    LogLine(what + L".");
 }
 
 void OnProcessFailed(int tabId, ICoreWebView2ProcessFailedEventArgs* args) {
     COREWEBVIEW2_PROCESS_FAILED_KIND kind{};
     if (!args || FAILED(args->get_ProcessFailedKind(&kind))) return;
+    LogProcessFailure(tabId, kind, args);
 
     if (kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED) {
         // The browser process took every webview with it, and each of them says so.
@@ -303,6 +382,15 @@ void WireTabEvents(int tabId) {
         }).Get(),
         nullptr);
 
+    // Whatever changes where Back and Forward lead: a page loaded, a fragment, pushState,
+    // a step back or forward. The tab's pages are asked for again.
+    webview->add_HistoryChanged(
+        Callback<ICoreWebView2HistoryChangedEventHandler>([tabId](ICoreWebView2*, IUnknown*) -> HRESULT {
+            NoteTabHistory(tabId);
+            return S_OK;
+        }).Get(),
+        nullptr);
+
     webview->add_WindowCloseRequested(
         Callback<ICoreWebView2WindowCloseRequestedEventHandler>([tabId](ICoreWebView2*, IUnknown*) -> HRESULT {
             OnWindowCloseRequested(tabId);
@@ -311,22 +399,24 @@ void WireTabEvents(int tabId) {
         nullptr);
 
     webview->AddWebResourceRequestedFilter(kHistoryUrl, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+    webview->AddWebResourceRequestedFilter(kBookmarksUrl, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
     webview->add_WebResourceRequested(
         Callback<ICoreWebView2WebResourceRequestedEventHandler>([](ICoreWebView2*,
                                                                    ICoreWebView2WebResourceRequestedEventArgs* args)
                                                                     -> HRESULT {
-            OnHistoryPageRequested(args);
+            OnPluginPageRequested(args);
             return S_OK;
         }).Get(),
         nullptr);
 
-    webview->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                                        [](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
-                                            OnWebMessage(args);
-                                            return S_OK;
-                                        })
-                                        .Get(),
-                                    nullptr);
+    webview->add_WebMessageReceived(
+        Callback<ICoreWebView2WebMessageReceivedEventHandler>([](ICoreWebView2* sender,
+                                                                 ICoreWebView2WebMessageReceivedEventArgs* args)
+                                                                  -> HRESULT {
+            OnWebMessage(sender, args);
+            return S_OK;
+        }).Get(),
+        nullptr);
 
     webview->add_ProcessFailed(
         Callback<ICoreWebView2ProcessFailedEventHandler>([tabId](ICoreWebView2*,

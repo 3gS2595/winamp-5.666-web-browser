@@ -18,14 +18,16 @@ namespace {
 // entry lParam says. Unlike the main window's, its wParam says which message it is.
 constexpr WPARAM kIpcPeDeleteIndex = 104;
 
-// On the first window's client, which lasts until Winamp exits: soon after anything that
-// may change what is to be done, then every so often for as long as Winamp plays the
-// pages' sound, to see them go quiet whichever way they do, closed tabs and windows too.
+// On the first window's client, which lasts until Winamp exits: every so often for as long
+// as Winamp plays the pages' sound, to see them go quiet whichever way they do, closed tabs
+// and windows too. Anything that may change what is to be done has a look taken at once
+// instead (FollowPageSound).
 constexpr UINT_PTR kSoundTimer = 2;
 constexpr UINT kSoundLookMs = 1000;
 
 SoundRule g_rule;
-std::wstring g_givenTitle; // the title in_exodium.dll has from us
+std::wstring g_givenTitle;                                   // the title in_exodium.dll has from us
+const std::wstring kPrivateSoundTitle = L"A private window"; // in place of a private page's own
 
 LRESULT Ipc(WPARAM param, LPARAM id) {
     return ::SendMessageW(g_app.winamp, WM_WA_IPC, param, id);
@@ -49,9 +51,12 @@ template <typename Function>
 
 [[nodiscard]] WinampPlayback Playback() {
     switch (Ipc(0, IPC_ISPLAYING)) {
-    case 1: return WinampPlayback::kPlaying;
-    case 3: return WinampPlayback::kPaused;
-    default: return WinampPlayback::kStopped;
+    case 1:
+        return WinampPlayback::kPlaying;
+    case 3:
+        return WinampPlayback::kPaused;
+    default:
+        return WinampPlayback::kStopped;
     }
 }
 
@@ -62,7 +67,8 @@ template <typename Function>
         if (win->closing) continue;
         for (int i = 0; i < static_cast<int>(win->tabs.size()); ++i) {
             const Tab& tab = win->tabs[i];
-            if (!tab.playingAudio) continue;
+            // A muted page is still said to be making sound, of which there is none to show.
+            if (!tab.playingAudio || tab.muted) continue;
             if (i == win->active) return &tab;
             if (!found) found = &tab;
         }
@@ -71,11 +77,13 @@ template <typename Function>
 }
 
 // Has in_exodium.dll show the tab's title, and Winamp ask again for it if it is playing.
+// A private window's page isn't named to Winamp, or to whatever follows what Winamp plays.
 void ShowTitle(const Tab& tab, bool playing) {
-    if (tab.title == g_givenTitle) return;
+    const std::wstring& title = tab.isPrivate ? kPrivateSoundTitle : tab.title;
+    if (title == g_givenTitle) return;
     const auto set = SoundExport<SetSoundTitleFunction>(kSetSoundTitleExport);
     if (!set) return;
-    g_givenTitle = tab.title;
+    g_givenTitle = title;
     set(g_givenTitle.c_str());
     if (playing) Ipc(0, IPC_UPDTITLE);
 }
@@ -125,7 +133,6 @@ void Look() {
         .audible = sounding != nullptr,
         .ours = ours,
         .winamp = Playback(),
-        .nowMs = ::GetTickCount64(),
     });
     switch (step) {
     case SoundStep::kStart:
@@ -149,8 +156,16 @@ void CALLBACK OnSoundTimer(HWND, UINT, UINT_PTR, DWORD) {
 } // namespace
 
 void FollowPageSound() {
-    // Not at once: this is called from inside webview events and Winamp's own messages.
-    KeepLooking(USER_TIMER_MINIMUM);
+    // Not from in here: this is called from inside webview events and Winamp's own messages.
+    // A message posted comes as soon as they are done with. Until 2026-11-07 a timer did it,
+    // which took 10 ms at the least and often a tick of Windows' clock (15.6 ms) more, every
+    // time a page started making sound.
+    if (g_app.windows.empty() || !g_app.windows.front()->client) return;
+    ::PostMessageW(g_app.windows.front()->client, kMsgFollowSound, 0, 0);
+}
+
+void LookAtPageSound() {
+    Look();
 }
 
 } // namespace exodium

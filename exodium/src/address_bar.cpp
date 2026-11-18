@@ -65,7 +65,8 @@ void ShowUserText(BrowserWindow& win) {
 
 // Rebuilds the list for win.userText.
 void UpdateSuggestions(BrowserWindow& win, bool allowCompletion) {
-    SuggestionList list = BuildSuggestions(g_app.history.entries(), win.userText, allowCompletion, UnixNow());
+    SuggestionList list =
+        BuildSuggestions(g_app.history.entries(), win.userText, allowCompletion, UnixNow(), g_app.bookmarks.entries());
     win.suggestions = std::move(list.rows);
     win.inlineText = std::move(list.inlineCompletion);
 
@@ -138,7 +139,14 @@ void NavigateTo(BrowserWindow& win, const std::wstring& url, bool typed) {
     NoteTypedNavigation(win);
     tab->typedNav = typed;
     if (tab->webview) {
-        tab->webview->Navigate(url.c_str());
+        // An address the webview won't take goes nowhere; the log says which it was, unless
+        // it was typed in a private window, of which nothing is written down.
+        if (const HRESULT asked = tab->webview->Navigate(url.c_str()); FAILED(asked)) {
+            tab->typedNav = false;
+            LogFailure(tab->isPrivate ? std::wstring(L"Going to an address in a private window")
+                                      : L"Going to " + url.substr(0, 200),
+                       asked);
+        }
     } else {
         tab->pendingUrl = url;
         ::PostMessageW(win.client, kMsgInitWebView, 0, 0);
@@ -225,6 +233,16 @@ LRESULT CALLBACK ControlProc(HWND control, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_GETDLGCODE:
         return DLGC_WANTALLKEYS | DLGC_WANTCHARS;
 
+    case WM_SYSKEYDOWN:
+        // A key with Alt: Alt+D, and Alt+Left and Right, are the browser's from here too.
+        if (HandleGlobalShortcut(win, wParam, CurrentModifiers())) return 0;
+        break;
+
+    case WM_SYSCHAR:
+        // What Alt+D leaves behind, which Windows would look for a menu with, and beep.
+        if (wParam == L'd' || wParam == L'D') return 0;
+        break;
+
     case WM_KEYDOWN: {
         const Modifiers mods = CurrentModifiers();
         if (HandleGlobalShortcut(win, wParam, mods)) return 0;
@@ -233,7 +251,17 @@ LRESULT CALLBACK ControlProc(HWND control, UINT msg, WPARAM wParam, LPARAM lPara
             win->editDirty = true;
             return 0;
         }
+        // The page's own keys while it has the keyboard, and the browser's from its controls.
+        if (win && HandleControlShortcut(*win, wParam, mods)) return 0;
         if (LRESULT result = 0; isUrlEdit && OnUrlKeyDown(*win, wParam, lParam, mods, result)) return result;
+        // Tab goes on from the browser's own controls into the page, and Shift+Tab into
+        // its far end. While the list of suggestions is open, Tab was the list's, above.
+        // Until 2026-11-09 it did nothing here: a new tab has the keyboard in the address
+        // bar, and there was no way on to the page but the mouse.
+        if (win && wParam == VK_TAB && !mods.ctrl && !mods.alt) {
+            TabIntoPage(*win, mods.shift);
+            return 0;
+        }
         if (win && wParam == VK_RETURN) {
             win->editDirty = false;
             NavigateFromUrlBox(*win);
@@ -349,11 +377,15 @@ void ShowPageUrl(BrowserWindow& win, std::wstring_view url) {
     const Selection selection = EditSelection(win.urlEdit);
     const bool wholeSelected = ::GetFocus() == win.urlEdit && selection.from == 0 &&
                                static_cast<int>(selection.to) == ::GetWindowTextLengthW(win.urlEdit);
-    SetUrlBoxText(win, std::wstring(url == kHistoryUrl ? std::wstring_view(kHistoryName) : url));
+    // One of the browser's own pages goes by its name, not by the address it is served at.
+    const std::wstring_view name = PluginPageName(url);
+    SetUrlBoxText(win, std::wstring(name.empty() ? url : name));
     if (wholeSelected) SelectAllText(win.urlEdit);
 }
 
 void UpdateUrlBox(BrowserWindow& win) {
+    // Whatever is being typed, the star says whether the page in view is a bookmark.
+    UpdateBookmarkButton(win);
     if (IsEditingUrl(win)) return;
     const Tab* tab = ActiveTab(win);
     if (!tab) return;
